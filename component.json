@@ -1,0 +1,8 @@
+{
+  "name": "rjs-wire",
+  "version": "0.0.0",
+  "dependencies": {
+    "wire": "https://github.com/cujojs/wire/archive/dev.zip",
+    "when": "~1.8.1"
+  }
+}
