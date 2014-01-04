@@ -10,34 +10,30 @@
  *
  * @author Brian Cavalier
  * @author John Hann
- *
- * @version 1.8.1
+ * @version 2.7.1
  */
-
 (function(define) { 
-define('when/when',[],function () {
-	var reduceArray, slice, undef;
+define('when/when',['require'],function (require) {
 
-	//
 	// Public API
-	//
 
-	when.defer     = defer;     // Create a deferred
-	when.resolve   = resolve;   // Create a resolved promise
-	when.reject    = reject;    // Create a rejected promise
+	when.promise   = promise;    // Create a pending promise
+	when.resolve   = resolve;    // Create a resolved promise
+	when.reject    = reject;     // Create a rejected promise
+	when.defer     = defer;      // Create a {promise, resolver} pair
 
-	when.join      = join;      // Join 2 or more promises
+	when.join      = join;       // Join 2 or more promises
 
-	when.all       = all;       // Resolve a list of promises
-	when.map       = map;       // Array.map() for promises
-	when.reduce    = reduce;    // Array.reduce() for promises
+	when.all       = all;        // Resolve a list of promises
+	when.map       = map;        // Array.map() for promises
+	when.reduce    = reduce;     // Array.reduce() for promises
+	when.settle    = settle;     // Settle a list of promises
 
-	when.any       = any;       // One-winner race
-	when.some      = some;      // Multi-winner race
+	when.any       = any;        // One-winner race
+	when.some      = some;       // Multi-winner race
 
-	when.chain     = chain;     // Make a promise trigger another resolver
-
-	when.isPromise = isPromise; // Determine if a thing is a promise
+	when.isPromise = isPromiseLike;  // DEPRECATED: use isPromiseLike
+	when.isPromiseLike = isPromiseLike; // Is something promise-like, aka thenable
 
 	/**
 	 * Register an observer for a promise or immediate value.
@@ -57,64 +53,239 @@ define('when/when',[],function () {
 	function when(promiseOrValue, onFulfilled, onRejected, onProgress) {
 		// Get a trusted promise for the input promiseOrValue, and then
 		// register promise handlers
-		return resolve(promiseOrValue).then(onFulfilled, onRejected, onProgress);
+		return cast(promiseOrValue).then(onFulfilled, onRejected, onProgress);
 	}
 
 	/**
-	 * Returns promiseOrValue if promiseOrValue is a {@link Promise}, a new Promise if
-	 * promiseOrValue is a foreign promise, or a new, already-fulfilled {@link Promise}
-	 * whose value is promiseOrValue if promiseOrValue is an immediate value.
-	 *
-	 * @param {*} promiseOrValue
-	 * @returns {Promise} Guaranteed to return a trusted Promise.  If promiseOrValue
-	 *   is trusted, returns promiseOrValue, otherwise, returns a new, already-resolved
-	 *   when.js promise whose resolution value is:
-	 *   * the resolution value of promiseOrValue if it's a foreign promise, or
-	 *   * promiseOrValue if it's a value
+	 * Creates a new promise whose fate is determined by resolver.
+	 * @param {function} resolver function(resolve, reject, notify)
+	 * @returns {Promise} promise whose fate is determine by resolver
 	 */
-	function resolve(promiseOrValue) {
-		var promise;
+	function promise(resolver) {
+		return new Promise(resolver,
+			monitorApi.PromiseStatus && monitorApi.PromiseStatus());
+	}
 
-		if(promiseOrValue instanceof Promise) {
-			// It's a when.js promise, so we trust it
-			promise = promiseOrValue;
+	/**
+	 * Trusted Promise constructor.  A Promise created from this constructor is
+	 * a trusted when.js promise.  Any other duck-typed promise is considered
+	 * untrusted.
+	 * @constructor
+	 * @returns {Promise} promise whose fate is determine by resolver
+	 * @name Promise
+	 */
+	function Promise(resolver, status) {
+		var self, value, consumers = [];
 
-		} else if(isPromise(promiseOrValue)) {
-			// Assimilate foreign promises
-			promise = assimilate(promiseOrValue);
-		} else {
-			// It's a value, create a fulfilled promise for it.
-			promise = fulfilled(promiseOrValue);
+		self = this;
+		this._status = status;
+		this.inspect = inspect;
+		this._when = _when;
+
+		// Call the provider resolver to seal the promise's fate
+		try {
+			resolver(promiseResolve, promiseReject, promiseNotify);
+		} catch(e) {
+			promiseReject(e);
 		}
 
-		return promise;
+		/**
+		 * Returns a snapshot of this promise's current status at the instant of call
+		 * @returns {{state:String}}
+		 */
+		function inspect() {
+			return value ? value.inspect() : toPendingState();
+		}
+
+		/**
+		 * Private message delivery. Queues and delivers messages to
+		 * the promise's ultimate fulfillment value or rejection reason.
+		 * @private
+		 */
+		function _when(resolve, notify, onFulfilled, onRejected, onProgress) {
+			consumers ? consumers.push(deliver) : enqueue(function() { deliver(value); });
+
+			function deliver(p) {
+				p._when(resolve, notify, onFulfilled, onRejected, onProgress);
+			}
+		}
+
+		/**
+		 * Transition from pre-resolution state to post-resolution state, notifying
+		 * all listeners of the ultimate fulfillment or rejection
+		 * @param {*} val resolution value
+		 */
+		function promiseResolve(val) {
+			if(!consumers) {
+				return;
+			}
+
+			var queue = consumers;
+			consumers = undef;
+
+			enqueue(function () {
+				value = coerce(self, val);
+				if(status) {
+					updateStatus(value, status);
+				}
+				runHandlers(queue, value);
+			});
+		}
+
+		/**
+		 * Reject this promise with the supplied reason, which will be used verbatim.
+		 * @param {*} reason reason for the rejection
+		 */
+		function promiseReject(reason) {
+			promiseResolve(new RejectedPromise(reason));
+		}
+
+		/**
+		 * Issue a progress event, notifying all progress listeners
+		 * @param {*} update progress event payload to pass to all listeners
+		 */
+		function promiseNotify(update) {
+			if(consumers) {
+				var queue = consumers;
+				enqueue(function () {
+					runHandlers(queue, new ProgressingPromise(update));
+				});
+			}
+		}
 	}
 
+	promisePrototype = Promise.prototype;
+
 	/**
-	 * Assimilate an untrusted thenable by introducing a trusted middle man.
-	 * Not a perfect strategy, but possibly the best we can do.
-	 * IMPORTANT: This is the only place when.js should ever call an untrusted
-	 * thenable's then() on an. Don't expose the return value to the untrusted thenable
-	 *
-	 * @param {*} thenable
-	 * @param {function} thenable.then
+	 * Register handlers for this promise.
+	 * @param [onFulfilled] {Function} fulfillment handler
+	 * @param [onRejected] {Function} rejection handler
+	 * @param [onProgress] {Function} progress handler
+	 * @return {Promise} new Promise
+	 */
+	promisePrototype.then = function(onFulfilled, onRejected, onProgress) {
+		var self = this;
+
+		return new Promise(function(resolve, reject, notify) {
+			self._when(resolve, notify, onFulfilled, onRejected, onProgress);
+		}, this._status && this._status.observed());
+	};
+
+	/**
+	 * Register a rejection handler.  Shortcut for .then(undefined, onRejected)
+	 * @param {function?} onRejected
+	 * @return {Promise}
+	 */
+	promisePrototype['catch'] = promisePrototype.otherwise = function(onRejected) {
+		return this.then(undef, onRejected);
+	};
+
+	/**
+	 * Ensures that onFulfilledOrRejected will be called regardless of whether
+	 * this promise is fulfilled or rejected.  onFulfilledOrRejected WILL NOT
+	 * receive the promises' value or reason.  Any returned value will be disregarded.
+	 * onFulfilledOrRejected may throw or return a rejected promise to signal
+	 * an additional error.
+	 * @param {function} onFulfilledOrRejected handler to be called regardless of
+	 *  fulfillment or rejection
 	 * @returns {Promise}
 	 */
-	function assimilate(thenable) {
-		var d = defer();
+	promisePrototype['finally'] = promisePrototype.ensure = function(onFulfilledOrRejected) {
+		return typeof onFulfilledOrRejected === 'function'
+			? this.then(injectHandler, injectHandler)['yield'](this)
+			: this;
 
-		// TODO: Enqueue this for future execution in 2.0
-		try {
-			thenable.then(
-				function(value)  { d.resolve(value); },
-				function(reason) { d.reject(reason); },
-				function(update) { d.progress(update); }
-			);
-		} catch(e) {
-			d.reject(e);
+		function injectHandler() {
+			return resolve(onFulfilledOrRejected());
 		}
+	};
 
-		return d.promise;
+	/**
+	 * Terminate a promise chain by handling the ultimate fulfillment value or
+	 * rejection reason, and assuming responsibility for all errors.  if an
+	 * error propagates out of handleResult or handleFatalError, it will be
+	 * rethrown to the host, resulting in a loud stack track on most platforms
+	 * and a crash on some.
+	 * @param {function?} handleResult
+	 * @param {function?} handleError
+	 * @returns {undefined}
+	 */
+	promisePrototype.done = function(handleResult, handleError) {
+		this.then(handleResult, handleError)['catch'](crash);
+	};
+
+	/**
+	 * Shortcut for .then(function() { return value; })
+	 * @param  {*} value
+	 * @return {Promise} a promise that:
+	 *  - is fulfilled if value is not a promise, or
+	 *  - if value is a promise, will fulfill with its value, or reject
+	 *    with its reason.
+	 */
+	promisePrototype['yield'] = function(value) {
+		return this.then(function() {
+			return value;
+		});
+	};
+
+	/**
+	 * Runs a side effect when this promise fulfills, without changing the
+	 * fulfillment value.
+	 * @param {function} onFulfilledSideEffect
+	 * @returns {Promise}
+	 */
+	promisePrototype.tap = function(onFulfilledSideEffect) {
+		return this.then(onFulfilledSideEffect)['yield'](this);
+	};
+
+	/**
+	 * Assumes that this promise will fulfill with an array, and arranges
+	 * for the onFulfilled to be called with the array as its argument list
+	 * i.e. onFulfilled.apply(undefined, array).
+	 * @param {function} onFulfilled function to receive spread arguments
+	 * @return {Promise}
+	 */
+	promisePrototype.spread = function(onFulfilled) {
+		return this.then(function(array) {
+			// array may contain promises, so resolve its contents.
+			return all(array, function(array) {
+				return onFulfilled.apply(undef, array);
+			});
+		});
+	};
+
+	/**
+	 * Shortcut for .then(onFulfilledOrRejected, onFulfilledOrRejected)
+	 * @deprecated
+	 */
+	promisePrototype.always = function(onFulfilledOrRejected, onProgress) {
+		return this.then(onFulfilledOrRejected, onFulfilledOrRejected, onProgress);
+	};
+
+	/**
+	 * Casts x to a trusted promise. If x is already a trusted promise, it is
+	 * returned, otherwise a new trusted Promise which follows x is returned.
+	 * @param {*} x
+	 * @returns {Promise}
+	 */
+	function cast(x) {
+		return x instanceof Promise ? x : resolve(x);
+	}
+
+	/**
+	 * Returns a resolved promise. The returned promise will be
+	 *  - fulfilled with promiseOrValue if it is a value, or
+	 *  - if promiseOrValue is a promise
+	 *    - fulfilled with promiseOrValue's value after it is fulfilled
+	 *    - rejected with promiseOrValue's reason after it is rejected
+	 * In contract to cast(x), this always creates a new Promise
+	 * @param  {*} value
+	 * @return {Promise}
+	 */
+	function resolve(value) {
+		return promise(function(resolve) {
+			resolve(value);
+		});
 	}
 
 	/**
@@ -128,271 +299,218 @@ define('when/when',[],function () {
 	 * @return {Promise} rejected {@link Promise}
 	 */
 	function reject(promiseOrValue) {
-		return when(promiseOrValue, rejected);
+		return when(promiseOrValue, function(e) {
+			return new RejectedPromise(e);
+		});
 	}
 
 	/**
-	 * Trusted Promise constructor.  A Promise created from this constructor is
-	 * a trusted when.js promise.  Any other duck-typed promise is considered
-	 * untrusted.
-	 * @constructor
-	 * @name Promise
+	 * Creates a {promise, resolver} pair, either or both of which
+	 * may be given out safely to consumers.
+	 * The resolver has resolve, reject, and progress.  The promise
+	 * has then plus extended promise API.
+	 *
+	 * @return {{
+	 * promise: Promise,
+	 * resolve: function:Promise,
+	 * reject: function:Promise,
+	 * notify: function:Promise
+	 * resolver: {
+	 *	resolve: function:Promise,
+	 *	reject: function:Promise,
+	 *	notify: function:Promise
+	 * }}}
 	 */
-	function Promise(then) {
-		this.then = then;
+	function defer() {
+		var deferred, pending, resolved;
+
+		// Optimize object shape
+		deferred = {
+			promise: undef, resolve: undef, reject: undef, notify: undef,
+			resolver: { resolve: undef, reject: undef, notify: undef }
+		};
+
+		deferred.promise = pending = promise(makeDeferred);
+
+		return deferred;
+
+		function makeDeferred(resolvePending, rejectPending, notifyPending) {
+			deferred.resolve = deferred.resolver.resolve = function(value) {
+				if(resolved) {
+					return resolve(value);
+				}
+				resolved = true;
+				resolvePending(value);
+				return pending;
+			};
+
+			deferred.reject  = deferred.resolver.reject  = function(reason) {
+				if(resolved) {
+					return resolve(new RejectedPromise(reason));
+				}
+				resolved = true;
+				rejectPending(reason);
+				return pending;
+			};
+
+			deferred.notify  = deferred.resolver.notify  = function(update) {
+				notifyPending(update);
+				return update;
+			};
+		}
 	}
 
-	Promise.prototype = {
-		/**
-		 * Register a callback that will be called when a promise is
-		 * fulfilled or rejected.  Optionally also register a progress handler.
-		 * Shortcut for .then(onFulfilledOrRejected, onFulfilledOrRejected, onProgress)
-		 * @param {function?} [onFulfilledOrRejected]
-		 * @param {function?} [onProgress]
-		 * @return {Promise}
-		 */
-		always: function(onFulfilledOrRejected, onProgress) {
-			return this.then(onFulfilledOrRejected, onFulfilledOrRejected, onProgress);
-		},
+	/**
+	 * Run a queue of functions as quickly as possible, passing
+	 * value to each.
+	 */
+	function runHandlers(queue, value) {
+		for (var i = 0; i < queue.length; i++) {
+			queue[i](value);
+		}
+	}
 
-		/**
-		 * Register a rejection handler.  Shortcut for .then(undefined, onRejected)
-		 * @param {function?} onRejected
-		 * @return {Promise}
-		 */
-		otherwise: function(onRejected) {
-			return this.then(undef, onRejected);
-		},
+	/**
+	 * Coerces x to a trusted Promise
+	 * @param {*} x thing to coerce
+	 * @returns {*} Guaranteed to return a trusted Promise.  If x
+	 *   is trusted, returns x, otherwise, returns a new, trusted, already-resolved
+	 *   Promise whose resolution value is:
+	 *   * the resolution value of x if it's a foreign promise, or
+	 *   * x if it's a value
+	 */
+	function coerce(self, x) {
+		if (x === self) {
+			return new RejectedPromise(new TypeError());
+		}
 
-		/**
-		 * Shortcut for .then(function() { return value; })
-		 * @param  {*} value
-		 * @return {Promise} a promise that:
-		 *  - is fulfilled if value is not a promise, or
-		 *  - if value is a promise, will fulfill with its value, or reject
-		 *    with its reason.
-		 */
-		'yield': function(value) {
-			return this.then(function() {
-				return value;
-			});
-		},
+		if (x instanceof Promise) {
+			return x;
+		}
 
-		/**
-		 * Assumes that this promise will fulfill with an array, and arranges
-		 * for the onFulfilled to be called with the array as its argument list
-		 * i.e. onFulfilled.apply(undefined, array).
-		 * @param {function} onFulfilled function to receive spread arguments
-		 * @return {Promise}
-		 */
-		spread: function(onFulfilled) {
-			return this.then(function(array) {
-				// array may contain promises, so resolve its contents.
-				return all(array, function(array) {
-					return onFulfilled.apply(undef, array);
-				});
-			});
+		try {
+			var untrustedThen = x === Object(x) && x.then;
+
+			return typeof untrustedThen === 'function'
+				? assimilate(untrustedThen, x)
+				: new FulfilledPromise(x);
+		} catch(e) {
+			return new RejectedPromise(e);
+		}
+	}
+
+	/**
+	 * Safely assimilates a foreign thenable by wrapping it in a trusted promise
+	 * @param {function} untrustedThen x's then() method
+	 * @param {object|function} x thenable
+	 * @returns {Promise}
+	 */
+	function assimilate(untrustedThen, x) {
+		return promise(function (resolve, reject) {
+			fcall(untrustedThen, x, resolve, reject);
+		});
+	}
+
+	makePromisePrototype = Object.create ||
+		function(o) {
+			function PromisePrototype() {}
+			PromisePrototype.prototype = o;
+			return new PromisePrototype();
+		};
+
+	/**
+	 * Creates a fulfilled, local promise as a proxy for a value
+	 * NOTE: must never be exposed
+	 * @private
+	 * @param {*} value fulfillment value
+	 * @returns {Promise}
+	 */
+	function FulfilledPromise(value) {
+		this.value = value;
+	}
+
+	FulfilledPromise.prototype = makePromisePrototype(promisePrototype);
+
+	FulfilledPromise.prototype.inspect = function() {
+		return toFulfilledState(this.value);
+	};
+
+	FulfilledPromise.prototype._when = function(resolve, _, onFulfilled) {
+		try {
+			resolve(typeof onFulfilled === 'function' ? onFulfilled(this.value) : this.value);
+		} catch(e) {
+			resolve(new RejectedPromise(e));
 		}
 	};
 
 	/**
-	 * Create an already-resolved promise for the supplied value
+	 * Creates a rejected, local promise as a proxy for a value
+	 * NOTE: must never be exposed
 	 * @private
-	 *
-	 * @param {*} value
-	 * @return {Promise} fulfilled promise
+	 * @param {*} reason rejection reason
+	 * @returns {Promise}
 	 */
-	function fulfilled(value) {
-		var p = new Promise(function(onFulfilled) {
-			try {
-				return resolve(typeof onFulfilled == 'function' ? onFulfilled(value) : value);
-			} catch(e) {
-				return rejected(e);
-			}
-		});
-
-		return p;
+	function RejectedPromise(reason) {
+		this.value = reason;
 	}
 
+	RejectedPromise.prototype = makePromisePrototype(promisePrototype);
+
+	RejectedPromise.prototype.inspect = function() {
+		return toRejectedState(this.value);
+	};
+
+	RejectedPromise.prototype._when = function(resolve, _, __, onRejected) {
+		try {
+			resolve(typeof onRejected === 'function' ? onRejected(this.value) : this);
+		} catch(e) {
+			resolve(new RejectedPromise(e));
+		}
+	};
+
 	/**
-	 * Create an already-rejected {@link Promise} with the supplied
-	 * rejection reason.
+	 * Create a progress promise with the supplied update.
 	 * @private
-	 *
-	 * @param {*} reason
-	 * @return {Promise} rejected promise
+	 * @param {*} value progress update value
+	 * @return {Promise} progress promise
 	 */
-	function rejected(reason) {
-		var p = new Promise(function(_, onRejected) {
-			try {
-				return resolve(typeof onRejected == 'function' ? onRejected(reason) : rejected(reason));
-			} catch(e) {
-				return rejected(e);
-			}
-		});
+	function ProgressingPromise(value) {
+		this.value = value;
+	}
 
-		return p;
+	ProgressingPromise.prototype = makePromisePrototype(promisePrototype);
+
+	ProgressingPromise.prototype._when = function(_, notify, f, r, u) {
+		try {
+			notify(typeof u === 'function' ? u(this.value) : this.value);
+		} catch(e) {
+			notify(e);
+		}
+	};
+
+	/**
+	 * Update a PromiseStatus monitor object with the outcome
+	 * of the supplied value promise.
+	 * @param {Promise} value
+	 * @param {PromiseStatus} status
+	 */
+	function updateStatus(value, status) {
+		value.then(statusFulfilled, statusRejected);
+
+		function statusFulfilled() { status.fulfilled(); }
+		function statusRejected(r) { status.rejected(r); }
 	}
 
 	/**
-	 * Creates a new, Deferred with fully isolated resolver and promise parts,
-	 * either or both of which may be given out safely to consumers.
-	 * The Deferred itself has the full API: resolve, reject, progress, and
-	 * then. The resolver has resolve, reject, and progress.  The promise
-	 * only has then.
-	 *
-	 * @return {Deferred}
+	 * Determines if x is promise-like, i.e. a thenable object
+	 * NOTE: Will return true for *any thenable object*, and isn't truly
+	 * safe, since it may attempt to access the `then` property of x (i.e.
+	 *  clever/malicious getters may do weird things)
+	 * @param {*} x anything
+	 * @returns {boolean} true if x is promise-like
 	 */
-	function defer() {
-		var deferred, promise, handlers, progressHandlers,
-			_then, _notify, _resolve;
-
-		/**
-		 * The promise for the new deferred
-		 * @type {Promise}
-		 */
-		promise = new Promise(then);
-
-		/**
-		 * The full Deferred object, with {@link Promise} and {@link Resolver} parts
-		 * @class Deferred
-		 * @name Deferred
-		 */
-		deferred = {
-			then:     then, // DEPRECATED: use deferred.promise.then
-			resolve:  promiseResolve,
-			reject:   promiseReject,
-			progress: promiseNotify, // DEPRECATED: use deferred.notify
-			notify:   promiseNotify,
-
-			promise:  promise,
-
-			resolver: {
-				resolve:  promiseResolve,
-				reject:   promiseReject,
-				progress: promiseNotify, // DEPRECATED: use deferred.notify
-				notify:   promiseNotify
-			}
-		};
-
-		handlers = [];
-		progressHandlers = [];
-
-		/**
-		 * Pre-resolution then() that adds the supplied callback, errback, and progback
-		 * functions to the registered listeners
-		 * @private
-		 *
-		 * @param {function?} [onFulfilled] resolution handler
-		 * @param {function?} [onRejected] rejection handler
-		 * @param {function?} [onProgress] progress handler
-		 */
-		_then = function(onFulfilled, onRejected, onProgress) {
-			var deferred, progressHandler;
-
-			deferred = defer();
-
-			progressHandler = typeof onProgress === 'function'
-				? function(update) {
-					try {
-						// Allow progress handler to transform progress event
-						deferred.notify(onProgress(update));
-					} catch(e) {
-						// Use caught value as progress
-						deferred.notify(e);
-					}
-				}
-				: function(update) { deferred.notify(update); };
-
-			handlers.push(function(promise) {
-				promise.then(onFulfilled, onRejected)
-					.then(deferred.resolve, deferred.reject, progressHandler);
-			});
-
-			progressHandlers.push(progressHandler);
-
-			return deferred.promise;
-		};
-
-		/**
-		 * Issue a progress event, notifying all progress listeners
-		 * @private
-		 * @param {*} update progress event payload to pass to all listeners
-		 */
-		_notify = function(update) {
-			processQueue(progressHandlers, update);
-			return update;
-		};
-
-		/**
-		 * Transition from pre-resolution state to post-resolution state, notifying
-		 * all listeners of the resolution or rejection
-		 * @private
-		 * @param {*} value the value of this deferred
-		 */
-		_resolve = function(value) {
-			// Replace _then with one that directly notifies with the result.
-			_then = value.then;
-			// Replace _resolve so that this Deferred can only be resolved once
-			_resolve = resolve;
-			// Make _progress a noop, to disallow progress for the resolved promise.
-			_notify = identity;
-
-			// Notify handlers
-			processQueue(handlers, value);
-
-			// Free progressHandlers array since we'll never issue progress events
-			progressHandlers = handlers = undef;
-
-			return value;
-		};
-
-		return deferred;
-
-		/**
-		 * Wrapper to allow _then to be replaced safely
-		 * @param {function?} [onFulfilled] resolution handler
-		 * @param {function?} [onRejected] rejection handler
-		 * @param {function?} [onProgress] progress handler
-		 * @return {Promise} new promise
-		 */
-		function then(onFulfilled, onRejected, onProgress) {
-			// TODO: Promises/A+ check typeof onFulfilled, onRejected, onProgress
-			return _then(onFulfilled, onRejected, onProgress);
-		}
-
-		/**
-		 * Wrapper to allow _resolve to be replaced
-		 */
-		function promiseResolve(val) {
-			return _resolve(resolve(val));
-		}
-
-		/**
-		 * Wrapper to allow _reject to be replaced
-		 */
-		function promiseReject(err) {
-			return _resolve(rejected(err));
-		}
-
-		/**
-		 * Wrapper to allow _notify to be replaced
-		 */
-		function promiseNotify(update) {
-			return _notify(update);
-		}
-	}
-
-	/**
-	 * Determines if promiseOrValue is a promise or not.  Uses the feature
-	 * test from http://wiki.commonjs.org/wiki/Promises/A to determine if
-	 * promiseOrValue is a promise.
-	 *
-	 * @param {*} promiseOrValue anything
-	 * @returns {boolean} true if promiseOrValue is a {@link Promise}
-	 */
-	function isPromise(promiseOrValue) {
-		return promiseOrValue && typeof promiseOrValue.then === 'function';
+	function isPromiseLike(x) {
+		return x && typeof x.then === 'function';
 	}
 
 	/**
@@ -404,75 +522,67 @@ define('when/when',[],function () {
 	 * @param {Array} promisesOrValues array of anything, may contain a mix
 	 *      of promises and values
 	 * @param howMany {number} number of promisesOrValues to resolve
-	 * @param {function?} [onFulfilled] resolution handler
-	 * @param {function?} [onRejected] rejection handler
-	 * @param {function?} [onProgress] progress handler
+	 * @param {function?} [onFulfilled] DEPRECATED, use returnedPromise.then()
+	 * @param {function?} [onRejected] DEPRECATED, use returnedPromise.then()
+	 * @param {function?} [onProgress] DEPRECATED, use returnedPromise.then()
 	 * @returns {Promise} promise that will resolve to an array of howMany values that
-	 * resolved first, or will reject with an array of (promisesOrValues.length - howMany) + 1
-	 * rejection reasons.
+	 *  resolved first, or will reject with an array of
+	 *  (promisesOrValues.length - howMany) + 1 rejection reasons.
 	 */
 	function some(promisesOrValues, howMany, onFulfilled, onRejected, onProgress) {
 
-		checkCallbacks(2, arguments);
-
 		return when(promisesOrValues, function(promisesOrValues) {
 
-			var toResolve, toReject, values, reasons, deferred, fulfillOne, rejectOne, notify, len, i;
+			return promise(resolveSome).then(onFulfilled, onRejected, onProgress);
 
-			len = promisesOrValues.length >>> 0;
+			function resolveSome(resolve, reject, notify) {
+				var toResolve, toReject, values, reasons, fulfillOne, rejectOne, len, i;
 
-			toResolve = Math.max(0, Math.min(howMany, len));
-			values = [];
+				len = promisesOrValues.length >>> 0;
 
-			toReject = (len - toResolve) + 1;
-			reasons = [];
+				toResolve = Math.max(0, Math.min(howMany, len));
+				values = [];
 
-			deferred = defer();
+				toReject = (len - toResolve) + 1;
+				reasons = [];
 
-			// No items in the input, resolve immediately
-			if (!toResolve) {
-				deferred.resolve(values);
+				// No items in the input, resolve immediately
+				if (!toResolve) {
+					resolve(values);
 
-			} else {
-				notify = deferred.notify;
+				} else {
+					rejectOne = function(reason) {
+						reasons.push(reason);
+						if(!--toReject) {
+							fulfillOne = rejectOne = identity;
+							reject(reasons);
+						}
+					};
 
-				rejectOne = function(reason) {
-					reasons.push(reason);
-					if(!--toReject) {
-						fulfillOne = rejectOne = noop;
-						deferred.reject(reasons);
-					}
-				};
+					fulfillOne = function(val) {
+						// This orders the values based on promise resolution order
+						values.push(val);
+						if (!--toResolve) {
+							fulfillOne = rejectOne = identity;
+							resolve(values);
+						}
+					};
 
-				fulfillOne = function(val) {
-					// This orders the values based on promise resolution order
-					// Another strategy would be to use the original position of
-					// the corresponding promise.
-					values.push(val);
-
-					if (!--toResolve) {
-						fulfillOne = rejectOne = noop;
-						deferred.resolve(values);
-					}
-				};
-
-				for(i = 0; i < len; ++i) {
-					if(i in promisesOrValues) {
-						when(promisesOrValues[i], fulfiller, rejecter, notify);
+					for(i = 0; i < len; ++i) {
+						if(i in promisesOrValues) {
+							when(promisesOrValues[i], fulfiller, rejecter, notify);
+						}
 					}
 				}
+
+				function rejecter(reason) {
+					rejectOne(reason);
+				}
+
+				function fulfiller(val) {
+					fulfillOne(val);
+				}
 			}
-
-			return deferred.promise.then(onFulfilled, onRejected, onProgress);
-
-			function rejecter(reason) {
-				rejectOne(reason);
-			}
-
-			function fulfiller(val) {
-				fulfillOne(val);
-			}
-
 		});
 	}
 
@@ -483,9 +593,9 @@ define('when/when',[],function () {
 	 *
 	 * @param {Array|Promise} promisesOrValues array of anything, may contain a mix
 	 *      of {@link Promise}s and values
-	 * @param {function?} [onFulfilled] resolution handler
-	 * @param {function?} [onRejected] rejection handler
-	 * @param {function?} [onProgress] progress handler
+	 * @param {function?} [onFulfilled] DEPRECATED, use returnedPromise.then()
+	 * @param {function?} [onRejected] DEPRECATED, use returnedPromise.then()
+	 * @param {function?} [onProgress] DEPRECATED, use returnedPromise.then()
 	 * @returns {Promise} promise that will resolve to the value that resolved first, or
 	 * will reject with an array of all rejected inputs.
 	 */
@@ -506,14 +616,13 @@ define('when/when',[],function () {
 	 *
 	 * @param {Array|Promise} promisesOrValues array of anything, may contain a mix
 	 *      of {@link Promise}s and values
-	 * @param {function?} [onFulfilled] resolution handler
-	 * @param {function?} [onRejected] rejection handler
-	 * @param {function?} [onProgress] progress handler
+	 * @param {function?} [onFulfilled] DEPRECATED, use returnedPromise.then()
+	 * @param {function?} [onRejected] DEPRECATED, use returnedPromise.then()
+	 * @param {function?} [onProgress] DEPRECATED, use returnedPromise.then()
 	 * @returns {Promise}
 	 */
 	function all(promisesOrValues, onFulfilled, onRejected, onProgress) {
-		checkCallbacks(1, arguments);
-		return map(promisesOrValues, identity).then(onFulfilled, onRejected, onProgress);
+		return _map(promisesOrValues, identity).then(onFulfilled, onRejected, onProgress);
 	}
 
 	/**
@@ -522,58 +631,79 @@ define('when/when',[],function () {
 	 * have fulfilled, or will reject when *any one* of the input promises rejects.
 	 */
 	function join(/* ...promises */) {
-		return map(arguments, identity);
+		return _map(arguments, identity);
 	}
 
 	/**
-	 * Traditional map function, similar to `Array.prototype.map()`, but allows
-	 * input to contain {@link Promise}s and/or values, and mapFunc may return
-	 * either a value or a {@link Promise}
-	 *
-	 * @param {Array|Promise} promise array of anything, may contain a mix
-	 *      of {@link Promise}s and values
-	 * @param {function} mapFunc mapping function mapFunc(value) which may return
-	 *      either a {@link Promise} or value
-	 * @returns {Promise} a {@link Promise} that will resolve to an array containing
-	 *      the mapped output values.
+	 * Settles all input promises such that they are guaranteed not to
+	 * be pending once the returned promise fulfills. The returned promise
+	 * will always fulfill, except in the case where `array` is a promise
+	 * that rejects.
+	 * @param {Array|Promise} array or promise for array of promises to settle
+	 * @returns {Promise} promise that always fulfills with an array of
+	 *  outcome snapshots for each input promise.
 	 */
-	function map(promise, mapFunc) {
-		return when(promise, function(array) {
-			var results, len, toResolve, resolve, i, d;
+	function settle(array) {
+		return _map(array, toFulfilledState, toRejectedState);
+	}
 
-			// Since we know the resulting length, we can preallocate the results
-			// array to avoid array expansions.
-			toResolve = len = array.length >>> 0;
-			results = [];
-			d = defer();
+	/**
+	 * Promise-aware array map function, similar to `Array.prototype.map()`,
+	 * but input array may contain promises or values.
+	 * @param {Array|Promise} array array of anything, may contain promises and values
+	 * @param {function} mapFunc map function which may return a promise or value
+	 * @returns {Promise} promise that will fulfill with an array of mapped values
+	 *  or reject if any input promise rejects.
+	 */
+	function map(array, mapFunc) {
+		return _map(array, mapFunc);
+	}
 
-			if(!toResolve) {
-				d.resolve(results);
-			} else {
+	/**
+	 * Internal map that allows a fallback to handle rejections
+	 * @param {Array|Promise} array array of anything, may contain promises and values
+	 * @param {function} mapFunc map function which may return a promise or value
+	 * @param {function?} fallback function to handle rejected promises
+	 * @returns {Promise} promise that will fulfill with an array of mapped values
+	 *  or reject if any input promise rejects.
+	 */
+	function _map(array, mapFunc, fallback) {
+		return when(array, function(array) {
 
-				resolve = function resolveOne(item, i) {
-					when(item, mapFunc).then(function(mapped) {
-						results[i] = mapped;
+			return new Promise(resolveMap);
 
-						if(!--toResolve) {
-							d.resolve(results);
-						}
-					}, d.reject);
-				};
+			function resolveMap(resolve, reject, notify) {
+				var results, len, toResolve, i;
+
+				// Since we know the resulting length, we can preallocate the results
+				// array to avoid array expansions.
+				toResolve = len = array.length >>> 0;
+				results = [];
+
+				if(!toResolve) {
+					resolve(results);
+					return;
+				}
 
 				// Since mapFunc may be async, get all invocations of it into flight
 				for(i = 0; i < len; i++) {
 					if(i in array) {
-						resolve(array[i], i);
+						resolveOne(array[i], i);
 					} else {
 						--toResolve;
 					}
 				}
 
+				function resolveOne(item, i) {
+					when(item, mapFunc, fallback).then(function(mapped) {
+						results[i] = mapped;
+
+						if(!--toResolve) {
+							resolve(results);
+						}
+					}, reject, notify);
+				}
 			}
-
-			return d.promise;
-
 		});
 	}
 
@@ -591,7 +721,7 @@ define('when/when',[],function () {
 	 * @returns {Promise} that will resolve to the final reduced value
 	 */
 	function reduce(promise, reduceFunc /*, initialValue */) {
-		var args = slice.call(arguments, 1);
+		var args = fcall(slice, arguments, 1);
 
 		return when(promise, function(array) {
 			var total;
@@ -612,102 +742,137 @@ define('when/when',[],function () {
 		});
 	}
 
-	/**
-	 * Ensure that resolution of promiseOrValue will trigger resolver with the
-	 * value or reason of promiseOrValue, or instead with resolveValue if it is provided.
-	 *
-	 * @param promiseOrValue
-	 * @param {Object} resolver
-	 * @param {function} resolver.resolve
-	 * @param {function} resolver.reject
-	 * @param {*} [resolveValue]
-	 * @returns {Promise}
-	 */
-	function chain(promiseOrValue, resolver, resolveValue) {
-		var useResolveValue = arguments.length > 2;
+	// Snapshot states
 
-		return when(promiseOrValue,
-			function(val) {
-				val = useResolveValue ? resolveValue : val;
-				resolver.resolve(val);
-				return val;
-			},
-			function(reason) {
-				resolver.reject(reason);
-				return rejected(reason);
-			},
-			function(update) {
-				typeof resolver.notify === 'function' && resolver.notify(update);
-				return update;
-			}
-		);
+	/**
+	 * Creates a fulfilled state snapshot
+	 * @private
+	 * @param {*} x any value
+	 * @returns {{state:'fulfilled',value:*}}
+	 */
+	function toFulfilledState(x) {
+		return { state: 'fulfilled', value: x };
+	}
+
+	/**
+	 * Creates a rejected state snapshot
+	 * @private
+	 * @param {*} x any reason
+	 * @returns {{state:'rejected',reason:*}}
+	 */
+	function toRejectedState(x) {
+		return { state: 'rejected', reason: x };
+	}
+
+	/**
+	 * Creates a pending state snapshot
+	 * @private
+	 * @returns {{state:'pending'}}
+	 */
+	function toPendingState() {
+		return { state: 'pending' };
 	}
 
 	//
-	// Utility functions
+	// Internals, utilities, etc.
 	//
 
-	/**
-	 * Apply all functions in queue to value
-	 * @param {Array} queue array of functions to execute
-	 * @param {*} value argument passed to each function
-	 */
-	function processQueue(queue, value) {
-		var handler, i = 0;
+	var promisePrototype, makePromisePrototype, reduceArray, slice, fcall, nextTick, handlerQueue,
+		funcProto, call, arrayProto, monitorApi,
+		capturedSetTimeout, cjsRequire, MutationObs, undef;
 
-		while (handler = queue[i++]) {
-			handler(value);
+	cjsRequire = require;
+
+	//
+	// Shared handler queue processing
+	//
+	// Credit to Twisol (https://github.com/Twisol) for suggesting
+	// this type of extensible queue + trampoline approach for
+	// next-tick conflation.
+
+	handlerQueue = [];
+
+	/**
+	 * Enqueue a task. If the queue is not currently scheduled to be
+	 * drained, schedule it.
+	 * @param {function} task
+	 */
+	function enqueue(task) {
+		if(handlerQueue.push(task) === 1) {
+			nextTick(drainQueue);
 		}
 	}
 
 	/**
-	 * Helper that checks arrayOfCallbacks to ensure that each element is either
-	 * a function, or null or undefined.
-	 * @private
-	 * @param {number} start index at which to start checking items in arrayOfCallbacks
-	 * @param {Array} arrayOfCallbacks array to check
-	 * @throws {Error} if any element of arrayOfCallbacks is something other than
-	 * a functions, null, or undefined.
+	 * Drain the handler queue entirely, being careful to allow the
+	 * queue to be extended while it is being processed, and to continue
+	 * processing until it is truly empty.
 	 */
-	function checkCallbacks(start, arrayOfCallbacks) {
-		// TODO: Promises/A+ update type checking and docs
-		var arg, i = arrayOfCallbacks.length;
+	function drainQueue() {
+		runHandlers(handlerQueue);
+		handlerQueue = [];
+	}
 
-		while(i > start) {
-			arg = arrayOfCallbacks[--i];
+	// Allow attaching the monitor to when() if env has no console
+	monitorApi = typeof console !== 'undefined' ? console : when;
 
-			if (arg != null && typeof arg != 'function') {
-				throw new Error('arg '+i+' must be a function');
-			}
+	// Sniff "best" async scheduling option
+	// Prefer process.nextTick or MutationObserver, then check for
+	// vertx and finally fall back to setTimeout
+	/*global process,document,setTimeout,MutationObserver,WebKitMutationObserver*/
+	if (typeof process === 'object' && process.nextTick) {
+		nextTick = process.nextTick;
+	} else if(MutationObs =
+		(typeof MutationObserver === 'function' && MutationObserver) ||
+			(typeof WebKitMutationObserver === 'function' && WebKitMutationObserver)) {
+		nextTick = (function(document, MutationObserver, drainQueue) {
+			var el = document.createElement('div');
+			new MutationObserver(drainQueue).observe(el, { attributes: true });
+
+			return function() {
+				el.setAttribute('x', 'x');
+			};
+		}(document, MutationObs, drainQueue));
+	} else {
+		try {
+			// vert.x 1.x || 2.x
+			nextTick = cjsRequire('vertx').runOnLoop || cjsRequire('vertx').runOnContext;
+		} catch(ignore) {
+			// capture setTimeout to avoid being caught by fake timers
+			// used in time based tests
+			capturedSetTimeout = setTimeout;
+			nextTick = function(t) { capturedSetTimeout(t, 0); };
 		}
 	}
 
-	/**
-	 * No-Op function used in method replacement
-	 * @private
-	 */
-	function noop() {}
+	//
+	// Capture/polyfill function and array utils
+	//
 
-	slice = [].slice;
+	// Safe function calls
+	funcProto = Function.prototype;
+	call = funcProto.call;
+	fcall = funcProto.bind
+		? call.bind(call)
+		: function(f, context) {
+			return f.apply(context, slice.call(arguments, 2));
+		};
+
+	// Safe array ops
+	arrayProto = [];
+	slice = arrayProto.slice;
 
 	// ES5 reduce implementation if native not available
 	// See: http://es5.github.com/#x15.4.4.21 as there are many
-	// specifics and edge cases.
-	reduceArray = [].reduce ||
+	// specifics and edge cases.  ES5 dictates that reduce.length === 1
+	// This implementation deviates from ES5 spec in the following ways:
+	// 1. It does not check if reduceFunc is a Callable
+	reduceArray = arrayProto.reduce ||
 		function(reduceFunc /*, initialValue */) {
 			/*jshint maxcomplexity: 7*/
-
-			// ES5 dictates that reduce.length === 1
-
-			// This implementation deviates from ES5 spec in the following ways:
-			// 1. It does not check if reduceFunc is a Callable
-
 			var arr, args, reduced, len, i;
 
 			i = 0;
-			// This generates a jshint warning, despite being valid
-			// "Missing 'new' prefix when invoking a constructor."
-			// See https://github.com/jshint/jshint/issues/392
 			arr = Object(this);
 			len = arr.length >>> 0;
 			args = arguments;
@@ -735,7 +900,6 @@ define('when/when',[],function () {
 
 			// Do the actual reduce
 			for(;i < len; ++i) {
-				// Skip holes
 				if(i in arr) {
 					reduced = reduceFunc(reduced, arr[i], i, arr);
 				}
@@ -748,16 +912,21 @@ define('when/when',[],function () {
 		return x;
 	}
 
+	function crash(fatalError) {
+		if(typeof monitorApi.reportUnhandled === 'function') {
+			monitorApi.reportUnhandled();
+		} else {
+			enqueue(function() {
+				throw fatalError;
+			});
+		}
+
+		throw fatalError;
+	}
+
 	return when;
 });
-})(typeof define == 'function' && define.amd
-	? define
-	: function (factory) { typeof exports === 'object'
-		? (module.exports = factory())
-		: (this.when      = factory());
-	}
-	// Boilerplate for AMD, Node, and browser global
-);
+})(typeof define === 'function' && define.amd ? define : function (factory) { module.exports = factory(require); });
 
 define('when', ['when/when'], function (main) { return main; });
 
@@ -771,16 +940,16 @@ define('when', ['when/when'], function (main) { return main; });
 (function(define){ 
 define('wire/lib/object',[],function() {
 
-	var emptyObject, hasOwn;
+	var hasOwn;
 
-	emptyObject = {};
 	hasOwn = Object.prototype.hasOwnProperty.call.bind(Object.prototype.hasOwnProperty);
 
 	return {
 		hasOwn: hasOwn,
 		isObject: isObject,
 		inherit: inherit,
-		mixin: mixin
+		mixin: mixin,
+		extend: extend
 	};
 
 	function isObject(it) {
@@ -802,13 +971,25 @@ define('wire/lib/object',[],function() {
 	 * @returns {object} to
 	 */
 	function mixin(to, from) {
-		for (var name in from) {
-			if (hasOwn(from, name) && !(name in emptyObject)) {
-				to[name] = from[name];
-			}
+		if(!from) {
+			return to;
 		}
 
-		return to;
+		return Object.keys(from).reduce(function(to, key) {
+			to[key] = from[key];
+			return to;
+		}, to);
+	}
+
+	/**
+	 * Beget a new object from base and then mixin own properties from
+	 * extensions.  Equivalent to mixin(inherit(base), extensions)
+	 * @param {object} base
+	 * @param {object} extensions
+	 * @returns {object}
+	 */
+	function extend(base, extensions) {
+		return mixin(inherit(base), extensions);
 	}
 
 });
@@ -818,25 +999,22 @@ define('wire/lib/object',[],function() {
 	// CommonJS
 	: function(factory) { module.exports = factory(); }
 );
-/** @license MIT License (c) copyright B Cavalier & J Hann */
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
 
 /**
- * Loading and merging modules
  * Licensed under the MIT License at:
  * http://www.opensource.org/licenses/mit-license.php
  *
- * @author: brian@hovercraftstudios.com
+ * @author: Brian Cavalier
+ * @author: John Hann
  */
 (function(define) { 
-define('wire/lib/loader',['require','when','./object'],function(require) {
+define('wire/lib/loader/adapter',['require','when'],function(require) {
 
-	var when, mixin, getPlatformLoader;
+	var when = require('when');
 
-	when = require('when');
-	mixin = require('./object').mixin;
-
-	// Get the platform's loader
-	getPlatformLoader = typeof exports == 'object'
+	// Sniff for the platform's loader
+	return typeof exports == 'object'
 		? function(require) {
 			return function(moduleId) {
 				try {
@@ -854,48 +1032,280 @@ define('wire/lib/loader',['require','when','./object'],function(require) {
 			};
 		};
 
-	return getModuleLoader;
-
-	/**
-	 * Create a module loader
-	 * @param {Object} context
-	 * @param {function} [context.moduleLoader] existing module loader from which
-	 *  the new module loader will inherit, if provided.
-	 * @param {Object} options
-	 * @param {function} [options.require] require function with which to configure
-	 *  the module loader
-	 * @return {Object} module loader with load() and merge() methods
-	 */
-	function getModuleLoader(context, options) {
-		var loadModule = options && options.require
-			? getPlatformLoader(options.require)
-			: context.moduleLoader || getPlatformLoader(require);
-
-		return {
-			load: loadModule,
-			merge: function(specs) {
-				return when(specs, function(specs) {
-					return when.resolve(Array.isArray(specs)
-						? mergeAll(specs, loadModule)
-						: (typeof specs === 'string' ? loadModule(specs) : specs));
-				});
-			}
-		};
-	}
-
-	function mergeAll(specs, loadModule) {
-		return when.reduce(specs, function(merged, module) {
-			return typeof module == 'string'
-				? when(loadModule(module), function(spec) { return mixin(merged, spec); })
-				: mixin(merged, module);
-		}, {});
-	}
-
 });
 }(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
 
 
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+(function(define) { 
+define('wire/lib/loader/moduleId',[],function() {
+
+	return {
+		base: base,
+		resolve: resolve
+	};
+
+	/**
+	 * Given a moduleId, returns the "basename".  For example:
+	 * base('foo/bar/baz') -> 'foo/bar'
+	 * base('foo') -> 'foo'
+	 * @param id
+	 * @returns {*}
+	 */
+	function base(id) {
+		if(!id) {
+			return '';
+		}
+
+		var split = id.lastIndexOf('/');
+		return split >= 0 ? id.slice(0, split) : id;
+	}
+
+	/**
+	 * Resolve id against base (which is also an id), such that the
+	 * returned resolved id contains no leading '.' or '..'
+	 * components.  Id may be relative or absolute, and may also
+	 * be an AMD plugin plus resource id, in which case both the
+	 * plugin id and the resource id may be relative or absolute.
+	 * @param {string} base module id against which id will be resolved
+	 * @param {string} id module id to resolve, may be an
+	 *  AMD plugin+resource id.
+	 * @returns {string} resolved id with no leading '.' or '..'
+	 *  components.  If the input id was an AMD plugin+resource id,
+	 *  both the plugin id and the resource id will be resolved in
+	 *  the returned id (thus neither will have leading '.' or '..'
+	 *  components)
+	 */
+	function resolve(base, id) {
+		if(typeof id != 'string') {
+			return base;
+		}
+
+		return id.split('!').map(function(part) {
+			return resolveId(base, part.trim());
+		}).join('!');
+	}
+
+	function resolveId(base, id) {
+		var up, prefix;
+
+		if(id == '' || id == '.' || id == './') {
+			return base;
+		}
+
+		if(id[0] != '.') {
+			return id;
+		}
+
+		prefix = base;
+
+		if(id == '..' || id == '../') {
+			up = 1;
+			id = '';
+		} else {
+			up = 0;
+			id = id.replace(/^(\.\.?\/)+/, function(s) {
+				s.replace(/\.\./g, function(s) {
+					up++;
+					return s;
+				});
+				return '';
+			});
+
+			if(id == '..') {
+				up++;
+				id = '';
+			} else if(id == '.') {
+				id = '';
+			}
+		}
+
+		if(up > 0) {
+			prefix = prefix.split('/');
+			up = Math.max(0, prefix.length - up);
+			prefix = prefix.slice(0, up).join('/');
+		}
+
+		if(id.length && id[0] !== '/' && prefix[prefix.length-1] !== '/') {
+			prefix += '/';
+		}
+
+		if(prefix[0] == '/') {
+			prefix = prefix.slice(1);
+		}
+
+		return prefix + id;
+	}
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(); }));
+
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+(function(define) { 
+define('wire/lib/loader/relative',['require','./moduleId'],function(require) {
+
+	var mid = require('./moduleId');
+
+	return function relativeLoader(loader, referenceId) {
+		referenceId = mid.base(referenceId);
+		return function(moduleId) {
+			return loader(mid.resolve(referenceId, moduleId));
+		};
+	};
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }));
+
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+
+(function(define) { 
+define('wire/lib/advice',['require','when'],function(require) {
+
+	var when;
+
+	when = require('when');
+
+	// Very simple advice functions for internal wire use only.
+	// This is NOT a replacement for meld.  These advices stack
+	// differently and will not be as efficient.
+	return {
+		before: before,
+		after: after,
+		beforeAsync: beforeAsync,
+		afterAsync: afterAsync
+	};
+
+	/**
+	 * Execute advice before f, passing same arguments to both, and
+	 * discarding advice's return value.
+	 * @param {function} f function to advise
+	 * @param {function} advice function to execute before f
+	 * @returns {function} advised function
+	 */
+	function before(f, advice) {
+		return function() {
+			advice.apply(this, arguments);
+			return f.apply(this, arguments);
+		}
+	}
+
+	/**
+	 * Execute advice after f, passing f's return value to advice
+	 * @param {function} f function to advise
+	 * @param {function} advice function to execute after f
+	 * @returns {function} advised function
+	 */
+	function after(f, advice) {
+		return function() {
+			return advice.call(this, f.apply(this, arguments));
+		}
+	}
+
+	/**
+	 * Execute f after a promise returned by advice fulfills. The same args
+	 * will be passed to both advice and f.
+	 * @param {function} f function to advise
+	 * @param {function} advice function to execute before f
+	 * @returns {function} advised function which always returns a promise
+	 */
+	function beforeAsync(f, advice) {
+		return function() {
+			var self, args;
+
+			self = this;
+			args = arguments;
+
+			return when(args, function() {
+				return advice.apply(self, args);
+			}).then(function() {
+				return f.apply(self, args);
+			});
+		}
+	}
+
+	/**
+	 * Execute advice after a promise returned by f fulfills. The same args
+	 * will be passed to both advice and f.
+	 * @param {function} f function to advise
+	 * @param {function} advice function to execute after f
+	 * @returns {function} advised function which always returns a promise
+	 */
+	function afterAsync(f, advice) {
+		return function() {
+			var self = this;
+
+			return when(arguments, function(args) {
+				return f.apply(self, args);
+			}).then(function(result) {
+				return advice.call(self, result);
+			});
+		}
+	}
+
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }));
+
 /** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+
+(function(define){ 
+	define('wire/lib/WireContext',['require','./object'],function(require) {
+
+		var object, undef;
+
+		object = require('./object');
+
+		function WireContext() {}
+
+		WireContext.inherit = function(parent, api) {
+			var contextApi, context;
+
+			contextApi = object.inherit(parent);
+			object.mixin(contextApi, api);
+
+			WireContext.prototype = contextApi;
+
+			context = new WireContext();
+			WireContext.prototype = undef;
+
+			return context;
+		};
+
+		return WireContext;
+
+	});
+}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
+
+/** @license MIT License (c) copyright 2011-2013 original author or authors */
 
 /**
  * sequence.js
@@ -903,11 +1313,17 @@ define('wire/lib/loader',['require','when','./object'],function(require) {
  * Run a set of task functions in sequence.  All tasks will
  * receive the same args.
  *
- * @author brian@hovercraftstudios.com
+ * @author Brian Cavalier
+ * @author John Hann
  */
 
 (function(define) {
-define('when/sequence',['./when'], function(when) {
+define('when/sequence',['require','./when'],function(require) {
+
+	var when, slice;
+
+	when = require('./when');
+	slice = Array.prototype.slice;
 
 	/**
 	 * Run array of tasks in sequence with no overlap
@@ -918,23 +1334,24 @@ define('when/sequence',['./when'], function(when) {
 	 * to position of the task in the tasks array
 	 */
 	return function sequence(tasks /*, args... */) {
-		var args = Array.prototype.slice.call(arguments, 1);
-		return when.reduce(tasks, function(results, task) {
-			return when(task.apply(null, args), function(result) {
-				results.push(result);
-				return results;
-			});
-		}, []);
+		var results = [];
+
+		return when.all(slice.call(arguments, 1)).then(function(args) {
+			return when.reduce(tasks, function(results, task) {
+				return when(task.apply(null, args), addResult);
+			}, results);
+		});
+
+		function addResult(result) {
+			results.push(result);
+			return results;
+		}
 	};
 
 });
-})(typeof define == 'function' && define.amd
-	? define
-	: function (deps, factory) { typeof exports == 'object'
-		? (module.exports = factory(require('./when')))
-		: (this.when_sequence = factory(this.when));
-	}
-	// Boilerplate for AMD, Node, and browser global
+})(
+	typeof define === 'function' && define.amd ? define : function (factory) { module.exports = factory(require); }
+	// Boilerplate for AMD and Node
 );
 
 
@@ -954,7 +1371,8 @@ define('wire/lib/array',[],function() {
 
 	return {
 		delegate: delegateArray,
-		fromArguments: fromArguments
+		fromArguments: fromArguments,
+		union: union
 	};
 
 	/**
@@ -971,6 +1389,28 @@ define('wire/lib/array',[],function() {
 		return slice.call(args, index||0);
 	}
 
+	/**
+	 * Returns a new set that is the union of the two supplied sets
+	 * @param {Array} a1 set
+	 * @param {Array} a2 set
+	 * @returns {Array} union of a1 and a2
+	 */
+	function union(a1, a2) {
+		// If either is empty, return the other
+		if(!a1.length) {
+			return a2.slice();
+		} else if(!a2.length) {
+			return a1.slice();
+		}
+
+		return a2.reduce(function(union, a2item) {
+			if(union.indexOf(a2item) === -1) {
+				union.push(a2item);
+			}
+			return union;
+		}, a1.slice());
+	}
+
 });
 })(typeof define == 'function'
 	// AMD
@@ -978,213 +1418,1102 @@ define('wire/lib/array',[],function() {
 	// CommonJS
 	: function(factory) { module.exports = factory(); }
 );
-/** @license MIT License (c) copyright B Cavalier & J Hann */
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
 
 /**
- * cancelable.js
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
  *
- * Decorator that makes a deferred "cancelable".  It adds a cancel() method that
- * will call a special cancel handler function and then reject the deferred.  The
- * cancel handler can be used to do resource cleanup, or anything else that should
- * be done before any other rejection handlers are executed.
- *
- * Usage:
- *
- * var cancelableDeferred = cancelable(when.defer(), myCancelHandler);
- *
- * @author brian@hovercraftstudios.com
+ * @author: Brian Cavalier
+ * @author: John Hann
  */
 
-(function(define) {
-define('when/cancelable',['./when'], function(when) {
-
-    /**
-     * Makes deferred cancelable, adding a cancel() method.
-     *
-     * @param deferred {Deferred} the {@link Deferred} to make cancelable
-     * @param canceler {Function} cancel handler function to execute when this deferred is canceled.  This
-     * is guaranteed to run before all other rejection handlers.  The canceler will NOT be executed if the
-     * deferred is rejected in the standard way, i.e. deferred.reject().  It ONLY executes if the deferred
-     * is canceled, i.e. deferred.cancel()
-     *
-     * @returns deferred, with an added cancel() method.
-     */
-    return function(deferred, canceler) {
-
-        var delegate = when.defer();
-
-        // Add a cancel method to the deferred to reject the delegate
-        // with the special canceled indicator.
-        deferred.cancel = function() {
-            return delegate.reject(canceler(deferred));
-        };
-
-        // Ensure that the original resolve, reject, and progress all forward
-        // to the delegate
-        deferred.promise.then(delegate.resolve, delegate.reject, delegate.notify);
-
-        // Replace deferred's promise with the delegate promise
-        deferred.promise = delegate.promise;
-
-        // Also replace deferred.then to allow it to be called safely and
-        // observe the cancellation
-		// TODO: Remove once deferred.then is removed
-        deferred.then = delegate.promise.then;
-
-        return deferred;
-    };
-
-});
-})(typeof define == 'function'
-    ? define
-    : function (deps, factory) { typeof module != 'undefined'
-        ? (module.exports = factory(require('./when')))
-        : (this.when_cancelable = factory(this.when));
-    }
-    // Boilerplate for AMD, Node, and browser global
-);
-
-
-
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/*global setTimeout:true*/
-
-/**
- * delay.js
- *
- * Helper that returns a promise that resolves after a delay.
- *
- * @author brian@hovercraftstudios.com
- */
-
-(function(define) {
-define('when/delay',['./when'], function(when) {
-
-    var undef;
-
-    /**
-     * Creates a new promise that will resolve after a msec delay.  If promise
-     * is supplied, the delay will start *after* the supplied promise is resolved.
-     *
-     * Usage:
-     * // Do something after 1 second, similar to using setTimeout
-     * delay(1000).then(doSomething);
-     * // or
-     * when(delay(1000), doSomething);
-     *
-     * // Do something 1 second after triggeringPromise resolves
-     * delay(triggeringPromise, 1000).then(doSomething, handleRejection);
-     * // or
-     * when(delay(triggeringPromise, 1000), doSomething, handleRejection);
-     *
-     * @param [promise] anything - any promise or value after which the delay will start
-     * @param msec {Number} delay in milliseconds
-     */
-    return function delay(promise, msec) {
-        if(arguments.length < 2) {
-            msec = promise >>> 0;
-            promise = undef;
-        }
-
-        var deferred = when.defer();
-
-        setTimeout(function() {
-            deferred.resolve(promise);
-        }, msec);
-
-        return deferred.promise;
-    };
-
-});
-})(typeof define == 'function'
-    ? define
-    : function (deps, factory) { typeof module != 'undefined'
-        ? (module.exports = factory(require('./when')))
-        : (this.when_delay = factory(this.when));
-    }
-    // Boilerplate for AMD, Node, and browser global
-);
-
-
-
-/**
- * Methods for dealing with async/promises not provided directly by when.js
- * @author: brian@hovercraftstudios.com
- */
 (function(define) { 
-define('wire/lib/async',['require','./array','when','when/cancelable','when/delay'],function(require) {
+define('wire/lib/Map',[],function() {
 
-	var array, when, cancelable, delay, undef;
-
-	array = require('./array');
-	when = require('when');
-	cancelable = require('when/cancelable');
-	delay = require('when/delay');
-
-	/**
-	 * Special object to hold a Promise that should not be resolved, but
-	 * rather should be passed through a promise chain *as the resolution value*
-	 * @param val
-	 */
-	function ResolvedValue(val) {
-		this.value = val;
+	function Map() {
+		this.clear();
 	}
 
-	return {
-		/**
-		 * Create a wrapped ResolvedValue
-		 * @param it
-		 * @return {ResolvedValue}
-		 */
-		wrapValue: function(it) {
-			return new ResolvedValue(it);
+	Map.prototype = {
+		get: function(key) {
+			var value, found;
+			found = this._data.some(function(entry) {
+				if(entry.key === key) {
+					value = entry.value;
+					return true;
+				}
+			});
+
+			return found ? value : arguments[1];
 		},
 
-		/**
-		 * If it is a PromiseKeeper, return it.value, otherwise return it.  See
-		 * PromiseKeeper above for an explanation.
-		 * @param it anything
-		 */
-		getValue: function(it) {
-			return it instanceof ResolvedValue ? it.value : it;
+		set: function(key, value) {
+			var replaced = this._data.some(function(entry) {
+				if(entry.key === key) {
+					entry.value = value;
+					return true;
+				}
+			});
+
+			if(!replaced) {
+				this._data.push({ key: key, value: value });
+			}
 		},
 
-		until: until
+		has: function(key) {
+			return this._data.some(function(entry) {
+				return entry.key === key;
+			});
+		},
+
+		'delete': function(key) {
+			var value, found;
+			found = this._data.some(function(entry, i, array) {
+				if(entry.key === key) {
+					value = entry.value;
+					array.splice(i, 1);
+					return true;
+				}
+			});
+		},
+
+		clear: function() {
+			this._data = [];
+		}
 	};
 
-	// TODO: Remove in favor of when/poll once it's released
-	// Slightly simplified version of when/poll
-	function until(work, interval, verifier) {
-	
-		var deferred = when.defer();
+	return Map;
 
-		verifier = verifier || function () { return false; };
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(); }));
 
-		function schedule() {
-			delay(interval).then(vote);
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+
+(function(define){ 
+define('wire/lib/WireProxy',['require','./object','./array'],function(require) {
+
+	var object, array;
+
+	object = require('./object');
+	array = require('./array');
+
+	/**
+	 * A base proxy for all components that wire creates.  It allows wire's
+	 * internals and plugins to work with components using a standard interface.
+	 * WireProxy instances may be extended to specialize the behavior of the
+	 * interface for a particular type of component.  For example, there is a
+	 * specialized version for DOM Nodes.
+	 * @param {*} target value to be proxied
+	 * @constructor
+	 */
+	function WireProxy(target) {
+		// read-only target
+		Object.defineProperty(this, 'target', { value: target });
+	}
+
+	WireProxy.prototype = {
+		/**
+		 * Get the value of the named property. Sub-types should
+		 * override to get properties from their targets in whatever
+		 * specialized way is necessary.
+		 * @param {string} property
+		 * @returns {*} the value or undefined
+		 */
+		get: function (property) {
+			return this.target[property];
+		},
+
+		/**
+		 * Set the value of the named property. Sub-types should
+		 * override to set properties on their targets in whatever
+		 * specialized way is necessary.
+		 * @param {string} property
+		 * @param {*} value
+		 * @returns {*}
+		 */
+		set: function (property, value) {
+			this.target[property] = value;
+			return value;
+		},
+
+		/**
+		 * Invoke the method, with the supplied args, on the proxy's
+		 * target. Sub-types should override to invoke methods their
+		 * targets in whatever specialized way is necessary.
+		 * @param {string|function} method name of method to invoke or
+		 *  a function to call using proxy's target as the thisArg
+		 * @param {array} args arguments to pass to method
+		 * @returns {*} the method's return value
+		 */
+		invoke: function (method, args) {
+			var target = this.target;
+
+			if (typeof method === 'string') {
+				method = target[method];
+			}
+
+			return method.apply(target, array.fromArguments(args));
+		},
+
+		/**
+		 * Add an aspect to the proxy's target. Sub-types should
+		 * override to add aspects in whatever specialized way is
+		 * necessary.
+		 * @param {String|Array|RegExp|Function} pointcut
+		 *  expression matching methods to be advised
+		 * @param {Object} aspect aspect to add
+		 * @returns {{remove:function}} object with remove() that
+		 *  will remove the aspect.
+		 */
+		advise: function(pointcut, aspect) {
+			throw new TypeError('Advice not supported on component type: ' + this.target);
+		},
+
+		/**
+		 * Destroy the proxy's target.  Sub-types should override
+		 * to destroy their targets in whatever specialized way is
+		 * necessary.
+		 */
+		destroy: function() {},
+
+		/**
+		 * Attempt to clone this proxy's target. Sub-types should
+		 * override to clone their targets in whatever specialized
+		 * way is necessary.
+		 * @param {object|array|function} thing thing to clone
+		 * @param {object} options
+		 * @param {boolean} options.deep if true and thing is an Array, try to deep clone its contents
+		 * @param {boolean} options.inherited if true and thing is an object, clone inherited and own properties.
+		 * @returns {*}
+		 */
+		clone: function (options) {
+			// don't try to clone a primitive
+			var target = this.target;
+
+			if (typeof target == 'function') {
+				// cloneThing doesn't clone functions, so clone here:
+				return target.bind();
+			} else if (typeof target != 'object') {
+				return target;
+			}
+
+			return cloneThing(target, options || {});
+		}
+	};
+
+	WireProxy.isProxy = isProxy;
+	WireProxy.getTarget = getTarget;
+	WireProxy.extend = extendProxy;
+
+	return WireProxy;
+
+	/**
+	 * Returns a new WireProxy, whose prototype is proxy, with extensions
+	 * as own properties.  This is the "official" way to extend the functionality
+	 * of an existing WireProxy.
+	 * @param {WireProxy} proxy proxy to extend
+	 * @param extensions
+	 * @returns {*}
+	 */
+	function extendProxy(proxy, extensions) {
+		if(!isProxy(proxy)) {
+			throw new Error('Cannot extend non-WireProxy');
 		}
 
-		function vote() {
-			when(work(),
-				function (result) {
-					when(verifier(result), handleNext, schedule);
-				
-					function handleNext(verification) {
-						return verification ? deferred.resolve(result) : schedule();
-					}
-				},
-				deferred.reject
-			);
+		return object.extend(proxy, extensions);
+	}
+
+	/**
+	 * Returns true if it is a WireProxy
+	 * @param {*} it
+	 * @returns {boolean}
+	 */
+	function isProxy(it) {
+		return it instanceof WireProxy;
+	}
+
+	/**
+	 * If it is a WireProxy (see isProxy), returns it's target.  Otherwise,
+	 * returns it;
+	 * @param {*} it
+	 * @returns {*}
+	 */
+	function getTarget(it) {
+		return isProxy(it) ? it.target : it;
+	}
+
+	/**
+	 * Try to clone thing, which can be an object, Array, or Function
+	 * @param {object|array|function} thing thing to clone
+	 * @param {object} options
+	 * @param {boolean} options.deep if true and thing is an Array, try to deep clone its contents
+	 * @param {boolean} options.inherited if true and thing is an object, clone inherited and own properties.
+	 * @returns {array|object|function} cloned thing
+	 */
+	function cloneThing (thing, options) {
+		var deep, inherited, clone, prop;
+		deep = options.deep;
+		inherited = options.inherited;
+
+		// Note: this filters out primitive properties and methods
+		if (typeof thing != 'object') {
+			return thing;
 		}
-
-		schedule();
-
-		return deferred.promise;
+		else if (thing instanceof Date) {
+			return new Date(thing.getTime());
+		}
+		else if (thing instanceof RegExp) {
+			return new RegExp(thing);
+		}
+		else if (Array.isArray(thing)) {
+			return deep
+				? thing.map(function (i) { return cloneThing(i, options); })
+				: thing.slice();
+		}
+		else {
+			clone = thing.constructor ? new thing.constructor() : {};
+			for (prop in thing) {
+				if (inherited || object.hasOwn(thing, prop)) {
+					clone[prop] = deep
+						? cloneThing(thing[prop], options)
+						: thing[prop];
+				}
+			}
+			return clone;
+		}
 	}
 
 });
-}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
+})(typeof define == 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }
+);
+/** @license MIT License (c) copyright 2011-2013 original author or authors */
+
+/**
+ * meld
+ * Aspect Oriented Programming for Javascript
+ *
+ * meld is part of the cujo.js family of libraries (http://cujojs.com/)
+ *
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author Brian Cavalier
+ * @author John Hann
+ * @version 1.3.0
+ */
+(function (define) {
+define('meld/meld',[],function () {
+
+	//
+	// Public API
+	//
+
+	// Add a single, specific type of advice
+	// returns a function that will remove the newly-added advice
+	meld.before =         adviceApi('before');
+	meld.around =         adviceApi('around');
+	meld.on =             adviceApi('on');
+	meld.afterReturning = adviceApi('afterReturning');
+	meld.afterThrowing =  adviceApi('afterThrowing');
+	meld.after =          adviceApi('after');
+
+	// Access to the current joinpoint in advices
+	meld.joinpoint =      joinpoint;
+
+	// DEPRECATED: meld.add(). Use meld() instead
+	// Returns a function that will remove the newly-added aspect
+	meld.add =            function() { return meld.apply(null, arguments); };
+
+	/**
+	 * Add an aspect to all matching methods of target, or to target itself if
+	 * target is a function and no pointcut is provided.
+	 * @param {object|function} target
+	 * @param {string|array|RegExp|function} [pointcut]
+	 * @param {object} aspect
+	 * @param {function?} aspect.before
+	 * @param {function?} aspect.on
+	 * @param {function?} aspect.around
+	 * @param {function?} aspect.afterReturning
+	 * @param {function?} aspect.afterThrowing
+	 * @param {function?} aspect.after
+	 * @returns {{ remove: function }|function} if target is an object, returns a
+	 *  remover { remove: function } whose remove method will remove the added
+	 *  aspect. If target is a function, returns the newly advised function.
+	 */
+	function meld(target, pointcut, aspect) {
+		var pointcutType, remove;
+
+		if(arguments.length < 3) {
+			return addAspectToFunction(target, pointcut);
+		} else {
+			if (isArray(pointcut)) {
+				remove = addAspectToAll(target, pointcut, aspect);
+			} else {
+				pointcutType = typeof pointcut;
+
+				if (pointcutType === 'string') {
+					if (typeof target[pointcut] === 'function') {
+						remove = addAspectToMethod(target, pointcut, aspect);
+					}
+
+				} else if (pointcutType === 'function') {
+					remove = addAspectToAll(target, pointcut(target), aspect);
+
+				} else {
+					remove = addAspectToMatches(target, pointcut, aspect);
+				}
+			}
+
+			return remove;
+		}
+
+	}
+
+	function Advisor(target, func) {
+
+		var orig, advisor, advised;
+
+		this.target = target;
+		this.func = func;
+		this.aspects = {};
+
+		orig = this.orig = target[func];
+		advisor = this;
+
+		advised = this.advised = function() {
+			var context, joinpoint, args, callOrig, afterType;
+
+			// If called as a constructor (i.e. using "new"), create a context
+			// of the correct type, so that all advice types (including before!)
+			// are called with the correct context.
+			if(this instanceof advised) {
+				// shamelessly derived from https://github.com/cujojs/wire/blob/c7c55fe50238ecb4afbb35f902058ab6b32beb8f/lib/component.js#L25
+				context = objectCreate(orig.prototype);
+				callOrig = function (args) {
+					return applyConstructor(orig, context, args);
+				};
+
+			} else {
+				context = this;
+				callOrig = function(args) {
+					return orig.apply(context, args);
+				};
+
+			}
+
+			args = slice.call(arguments);
+			afterType = 'afterReturning';
+
+			// Save the previous joinpoint and set the current joinpoint
+			joinpoint = pushJoinpoint({
+				target: context,
+				method: func,
+				args: args
+			});
+
+			try {
+				advisor._callSimpleAdvice('before', context, args);
+
+				try {
+					joinpoint.result = advisor._callAroundAdvice(context, func, args, callOrigAndOn);
+				} catch(e) {
+					joinpoint.result = joinpoint.exception = e;
+					// Switch to afterThrowing
+					afterType = 'afterThrowing';
+				}
+
+				args = [joinpoint.result];
+
+				callAfter(afterType, args);
+				callAfter('after', args);
+
+				if(joinpoint.exception) {
+					throw joinpoint.exception;
+				}
+
+				return joinpoint.result;
+
+			} finally {
+				// Restore the previous joinpoint, if necessary.
+				popJoinpoint();
+			}
+
+			function callOrigAndOn(args) {
+				var result = callOrig(args);
+				advisor._callSimpleAdvice('on', context, args);
+
+				return result;
+			}
+
+			function callAfter(afterType, args) {
+				advisor._callSimpleAdvice(afterType, context, args);
+			}
+		};
+
+		defineProperty(advised, '_advisor', { value: advisor, configurable: true });
+	}
+
+	Advisor.prototype = {
+
+		/**
+		 * Invoke all advice functions in the supplied context, with the supplied args
+		 *
+		 * @param adviceType
+		 * @param context
+		 * @param args
+		 */
+		_callSimpleAdvice: function(adviceType, context, args) {
+
+			// before advice runs LIFO, from most-recently added to least-recently added.
+			// All other advice is FIFO
+			var iterator, advices;
+
+			advices = this.aspects[adviceType];
+			if(!advices) {
+				return;
+			}
+
+			iterator = iterators[adviceType];
+
+			iterator(this.aspects[adviceType], function(aspect) {
+				var advice = aspect.advice;
+				advice && advice.apply(context, args);
+			});
+		},
+
+		/**
+		 * Invoke all around advice and then the original method
+		 *
+		 * @param context
+		 * @param method
+		 * @param args
+		 * @param applyOriginal
+		 */
+		_callAroundAdvice: function (context, method, args, applyOriginal) {
+			var len, aspects;
+
+			aspects = this.aspects.around;
+			len = aspects ? aspects.length : 0;
+
+			/**
+			 * Call the next function in the around chain, which will either be another around
+			 * advice, or the orig method.
+			 * @param i {Number} index of the around advice
+			 * @param args {Array} arguments with with to call the next around advice
+			 */
+			function callNext(i, args) {
+				// If we exhausted all aspects, finally call the original
+				// Otherwise, if we found another around, call it
+				return i < 0
+					? applyOriginal(args)
+					: callAround(aspects[i].advice, i, args);
+			}
+
+			function callAround(around, i, args) {
+				var proceedCalled, joinpoint;
+
+				proceedCalled = 0;
+
+				// Joinpoint is immutable
+				// TODO: Use Object.freeze once v8 perf problem is fixed
+				joinpoint = pushJoinpoint({
+					target: context,
+					method: method,
+					args: args,
+					proceed: proceedCall,
+					proceedApply: proceedApply,
+					proceedCount: proceedCount
+				});
+
+				try {
+					// Call supplied around advice function
+					return around.call(context, joinpoint);
+				} finally {
+					popJoinpoint();
+				}
+
+				/**
+				 * The number of times proceed() has been called
+				 * @return {Number}
+				 */
+				function proceedCount() {
+					return proceedCalled;
+				}
+
+				/**
+				 * Proceed to the original method/function or the next around
+				 * advice using original arguments or new argument list if
+				 * arguments.length > 0
+				 * @return {*} result of original method/function or next around advice
+				 */
+				function proceedCall(/* newArg1, newArg2... */) {
+					return proceed(arguments.length > 0 ? slice.call(arguments) : args);
+				}
+
+				/**
+				 * Proceed to the original method/function or the next around
+				 * advice using original arguments or new argument list if
+				 * newArgs is supplied
+				 * @param [newArgs] {Array} new arguments with which to proceed
+				 * @return {*} result of original method/function or next around advice
+				 */
+				function proceedApply(newArgs) {
+					return proceed(newArgs || args);
+				}
+
+				/**
+				 * Create proceed function that calls the next around advice, or
+				 * the original.  May be called multiple times, for example, in retry
+				 * scenarios
+				 * @param [args] {Array} optional arguments to use instead of the
+				 * original arguments
+				 */
+				function proceed(args) {
+					proceedCalled++;
+					return callNext(i - 1, args);
+				}
+
+			}
+
+			return callNext(len - 1, args);
+		},
+
+		/**
+		 * Adds the supplied aspect to the advised target method
+		 *
+		 * @param aspect
+		 */
+		add: function(aspect) {
+
+			var advisor, aspects;
+
+			advisor = this;
+			aspects = advisor.aspects;
+
+			insertAspect(aspects, aspect);
+
+			return {
+				remove: function () {
+					var remaining = removeAspect(aspects, aspect);
+
+					// If there are no aspects left, restore the original method
+					if (!remaining) {
+						advisor.remove();
+					}
+				}
+			};
+		},
+
+		/**
+		 * Removes the Advisor and thus, all aspects from the advised target method, and
+		 * restores the original target method, copying back all properties that may have
+		 * been added or updated on the advised function.
+		 */
+		remove: function () {
+			delete this.advised._advisor;
+			this.target[this.func] = this.orig;
+		}
+	};
+
+	/**
+	 * Returns the advisor for the target object-function pair.  A new advisor
+	 * will be created if one does not already exist.
+	 * @param target {*} target containing a method with tthe supplied methodName
+	 * @param methodName {String} name of method on target for which to get an advisor
+	 * @return {Object|undefined} existing or newly created advisor for the supplied method
+	 */
+	Advisor.get = function(target, methodName) {
+		if(!(methodName in target)) {
+			return;
+		}
+
+		var advisor, advised;
+
+		advised = target[methodName];
+
+		if(typeof advised !== 'function') {
+			throw new Error('Advice can only be applied to functions: ' + methodName);
+		}
+
+		advisor = advised._advisor;
+		if(!advisor) {
+			advisor = new Advisor(target, methodName);
+			target[methodName] = advisor.advised;
+		}
+
+		return advisor;
+	};
+
+	/**
+	 * Add an aspect to a pure function, returning an advised version of it.
+	 * NOTE: *only the returned function* is advised.  The original (input) function
+	 * is not modified in any way.
+	 * @param func {Function} function to advise
+	 * @param aspect {Object} aspect to add
+	 * @return {Function} advised function
+	 */
+	function addAspectToFunction(func, aspect) {
+		var name, placeholderTarget;
+
+		name = func.name || '_';
+
+		placeholderTarget = {};
+		placeholderTarget[name] = func;
+
+		addAspectToMethod(placeholderTarget, name, aspect);
+
+		return placeholderTarget[name];
+
+	}
+
+	function addAspectToMethod(target, method, aspect) {
+		var advisor = Advisor.get(target, method);
+
+		return advisor && advisor.add(aspect);
+	}
+
+	function addAspectToAll(target, methodArray, aspect) {
+		var removers, added, f, i;
+
+		removers = [];
+		i = 0;
+
+		while((f = methodArray[i++])) {
+			added = addAspectToMethod(target, f, aspect);
+			added && removers.push(added);
+		}
+
+		return createRemover(removers);
+	}
+
+	function addAspectToMatches(target, pointcut, aspect) {
+		var removers = [];
+		// Assume the pointcut is a an object with a .test() method
+		for (var p in target) {
+			// TODO: Decide whether hasOwnProperty is correct here
+			// Only apply to own properties that are functions, and match the pointcut regexp
+			if (typeof target[p] == 'function' && pointcut.test(p)) {
+				// if(object.hasOwnProperty(p) && typeof object[p] === 'function' && pointcut.test(p)) {
+				removers.push(addAspectToMethod(target, p, aspect));
+			}
+		}
+
+		return createRemover(removers);
+	}
+
+	function createRemover(removers) {
+		return {
+			remove: function() {
+				for (var i = removers.length - 1; i >= 0; --i) {
+					removers[i].remove();
+				}
+			}
+		};
+	}
+
+	// Create an API function for the specified advice type
+	function adviceApi(type) {
+		return function(target, method, adviceFunc) {
+			var aspect = {};
+
+			if(arguments.length === 2) {
+				aspect[type] = method;
+				return meld(target, aspect);
+			} else {
+				aspect[type] = adviceFunc;
+				return meld(target, method, aspect);
+			}
+		};
+	}
+
+	/**
+	 * Insert the supplied aspect into aspectList
+	 * @param aspectList {Object} list of aspects, categorized by advice type
+	 * @param aspect {Object} aspect containing one or more supported advice types
+	 */
+	function insertAspect(aspectList, aspect) {
+		var adviceType, advice, advices;
+
+		for(adviceType in iterators) {
+			advice = aspect[adviceType];
+
+			if(advice) {
+				advices = aspectList[adviceType];
+				if(!advices) {
+					aspectList[adviceType] = advices = [];
+				}
+
+				advices.push({
+					aspect: aspect,
+					advice: advice
+				});
+			}
+		}
+	}
+
+	/**
+	 * Remove the supplied aspect from aspectList
+	 * @param aspectList {Object} list of aspects, categorized by advice type
+	 * @param aspect {Object} aspect containing one or more supported advice types
+	 * @return {Number} Number of *advices* left on the advised function.  If
+	 *  this returns zero, then it is safe to remove the advisor completely.
+	 */
+	function removeAspect(aspectList, aspect) {
+		var adviceType, advices, remaining;
+
+		remaining = 0;
+
+		for(adviceType in iterators) {
+			advices = aspectList[adviceType];
+			if(advices) {
+				remaining += advices.length;
+
+				for (var i = advices.length - 1; i >= 0; --i) {
+					if (advices[i].aspect === aspect) {
+						advices.splice(i, 1);
+						--remaining;
+						break;
+					}
+				}
+			}
+		}
+
+		return remaining;
+	}
+
+	function applyConstructor(C, instance, args) {
+		try {
+			// Try to define a constructor, but don't care if it fails
+			defineProperty(instance, 'constructor', {
+				value: C,
+				enumerable: false
+			});
+		} catch(e) {
+			// ignore
+		}
+
+		C.apply(instance, args);
+
+		return instance;
+	}
+
+	var currentJoinpoint, joinpointStack,
+		ap, prepend, append, iterators, slice, isArray, defineProperty, objectCreate;
+
+	// TOOD: Freeze joinpoints when v8 perf problems are resolved
+//	freeze = Object.freeze || function (o) { return o; };
+
+	joinpointStack = [];
+
+	ap      = Array.prototype;
+	prepend = ap.unshift;
+	append  = ap.push;
+	slice   = ap.slice;
+
+	isArray = Array.isArray || function(it) {
+		return Object.prototype.toString.call(it) == '[object Array]';
+	};
+
+	// Check for a *working* Object.defineProperty, fallback to
+	// simple assignment.
+	defineProperty = definePropertyWorks()
+		? Object.defineProperty
+		: function(obj, prop, descriptor) {
+		obj[prop] = descriptor.value;
+	};
+
+	objectCreate = Object.create ||
+		(function() {
+			function F() {}
+			return function(proto) {
+				F.prototype = proto;
+				var instance = new F();
+				F.prototype = null;
+				return instance;
+			};
+		}());
+
+	iterators = {
+		// Before uses reverse iteration
+		before: forEachReverse,
+		around: false
+	};
+
+	// All other advice types use forward iteration
+	// Around is a special case that uses recursion rather than
+	// iteration.  See Advisor._callAroundAdvice
+	iterators.on
+		= iterators.afterReturning
+		= iterators.afterThrowing
+		= iterators.after
+		= forEach;
+
+	function forEach(array, func) {
+		for (var i = 0, len = array.length; i < len; i++) {
+			func(array[i]);
+		}
+	}
+
+	function forEachReverse(array, func) {
+		for (var i = array.length - 1; i >= 0; --i) {
+			func(array[i]);
+		}
+	}
+
+	function joinpoint() {
+		return currentJoinpoint;
+	}
+
+	function pushJoinpoint(newJoinpoint) {
+		joinpointStack.push(currentJoinpoint);
+		return currentJoinpoint = newJoinpoint;
+	}
+
+	function popJoinpoint() {
+		return currentJoinpoint = joinpointStack.pop();
+	}
+
+	function definePropertyWorks() {
+		try {
+			return 'x' in Object.defineProperty({}, 'x', {});
+		} catch (e) { /* return falsey */ }
+	}
+
+	return meld;
+
+});
+})(typeof define == 'function' && define.amd ? define : function (factory) { module.exports = factory(); }
+);
+
+define('meld', ['meld/meld'], function (main) { return main; });
+
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+
+(function(define) { 
+define('wire/lib/ObjectProxy',['require','./WireProxy','./object','./advice','meld'],function(require) {
+
+	var WireProxy, extend, before, meld, advise, superDestroy;
+
+	WireProxy = require('./WireProxy');
+	extend = require('./object').extend;
+	before = require('./advice').before;
+	meld = require('meld');
+
+	// FIXME: Remove support for meld.add after deprecation period
+	advise = typeof meld === 'function' ? meld : meld.add;
+
+	superDestroy = WireProxy.prototype.destroy;
+
+	function ObjectProxy(target) {
+		WireProxy.apply(this, arguments);
+	}
+
+	ObjectProxy.prototype = extend(WireProxy.prototype, {
+		/**
+		 * Add an aspect to the proxy's target. Sub-types should
+		 * override to add aspects in whatever specialized way is
+		 * necessary.
+		 * @param {String|Array|RegExp|Function} pointcut
+		 *  expression matching methods to be advised
+		 * @param {Object} aspect aspect to add
+		 * @returns {{remove:function}} object with remove() that
+		 *  will remove the aspect.
+		 */
+		advise: function(pointcut, aspect) {
+			return advise(this.target, pointcut, aspect);
+		}
+
+
+	});
+
+	return ObjectProxy;
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }));
+
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+
+(function(define) { 
+define('wire/lib/ComponentFactory',['require','when','./object','./WireProxy','./ObjectProxy'],function(require) {
+
+	var when, object, WireProxy, ObjectProxy, undef;
+
+	when = require('when');
+	object = require('./object');
+	WireProxy = require('./WireProxy');
+	ObjectProxy = require('./ObjectProxy');
+
+	function ComponentFactory(lifecycle, plugins, pluginApi) {
+		this.plugins = plugins;
+		this.pluginApi = pluginApi;
+		this.lifecycle = lifecycle;
+		this.proxies = [];
+	}
+
+	ComponentFactory.prototype = {
+
+		create: function(component) {
+			var found;
+
+			// Look for a factory, then use it to create the object
+			found = this.getFactory(component.spec);
+			return found
+				? this._create(component, found.factory, found.options)
+				: when.reject(component);
+		},
+
+		_create: function(component, factory, options) {
+			var instance, self;
+
+			instance = when.defer();
+			self = this;
+
+			factory(instance.resolver, options,
+				this.pluginApi.contextualize(component.id));
+
+			return instance.promise.then(function(instance) {
+				return self.processComponent(component, instance);
+			});
+		},
+
+		processComponent: function(component, instance) {
+			var self, proxy;
+
+			self = this;
+			proxy = this.createProxy(instance, component);
+
+			return self.initInstance(proxy).then(
+				function(proxy) {
+					return self.startupInstance(proxy);
+				}
+			);
+		},
+
+		initInstance: function(proxy) {
+			return this.lifecycle.init(proxy);
+		},
+
+		startupInstance: function(proxy) {
+			return this.lifecycle.startup(proxy);
+		},
+
+		createProxy: function(instance, component) {
+			var proxy;
+
+			if (WireProxy.isProxy(instance)) {
+				proxy = instance;
+				instance = WireProxy.getTarget(proxy);
+			} else {
+				proxy = new ObjectProxy(instance);
+			}
+
+			proxy = this.initProxy(proxy);
+
+			if(component) {
+				component.proxy = proxy;
+				proxy.id = component.id;
+				proxy.metadata = component;
+			}
+
+			this._registerProxy(proxy);
+
+			return proxy;
+		},
+
+		initProxy: function(proxy) {
+
+			var proxiers = this.plugins.proxiers;
+
+			// Allow proxy plugins to process/modify the proxy
+			proxy = proxiers.reduce(
+				function(proxy, proxier) {
+					var overridden = proxier(proxy);
+					return WireProxy.isProxy(overridden) ? overridden : proxy;
+				},
+				proxy
+			);
+
+			return proxy;
+		},
+
+		destroy: function() {
+			var proxies, lifecycle;
+
+			proxies = this.proxies;
+			lifecycle = this.lifecycle;
+
+			return shutdownComponents().then(destroyComponents);
+
+			function shutdownComponents() {
+				return when.reduce(proxies,
+					function(_, proxy) { return lifecycle.shutdown(proxy); },
+					undef);
+			}
+
+			function destroyComponents() {
+				return when.reduce(proxies,
+					function(_, proxy) { return proxy.destroy(); },
+					undef);
+			}
+		},
+
+		_registerProxy: function(proxy) {
+			if(proxy.metadata) {
+				proxy.path = proxy.metadata.path;
+				this.proxies.push(proxy);
+			}
+		},
+
+		getFactory: function(spec) {
+			var f, factories, found;
+
+			factories = this.plugins.factories;
+
+			for (f in factories) {
+				if (object.hasOwn(spec, f)) {
+					found = {
+						factory: factories[f],
+						options: {
+							options: spec[f],
+							spec: spec
+						}
+					};
+					break;
+				}
+			}
+
+			// Intentionally returns undefined if no factory found
+			return found;
+
+		}
+	};
+
+	return ComponentFactory;
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }));
 
 /** @license MIT License (c) copyright B Cavalier & J Hann */
 
@@ -1203,8 +2532,9 @@ define('wire/lib/lifecycle',['require','when'],function(require) {
 		id: { value: 1 }
 	};
 
-	function Lifecycle(config) {
-		this._config = config;
+	function Lifecycle(plugins, pluginApi) {
+		this._plugins = plugins;
+		this._pluginApi = pluginApi;
 	}
 
 	Lifecycle.prototype = {
@@ -1223,25 +2553,25 @@ define('wire/lib/lifecycle',['require','when'],function(require) {
 		steps = generateSteps(steps);
 
 		return function(proxy) {
-			var self, pluginApi;
+			var plugins, pluginApi;
 
-			self = this;
-			pluginApi = this._config.pluginApi.contextualize(proxy.id);
+			plugins = this._plugins;
+			pluginApi = this._pluginApi.contextualize(proxy.id);
 
 			return when.reduce(steps, function (unused, step) {
-				return processFacets(step, proxy, pluginApi, self._config);
+				return processFacets(step, proxy, pluginApi, plugins);
 			}, proxy);
 		};
 	}
 
-	function processFacets(step, proxy, api, config) {
+	function processFacets(step, proxy, api, plugins) {
 		var promises, metadata, options, name, spec, facets, safeNames, unprocessed;
 
 		promises = [];
 		metadata = proxy.metadata;
 		spec = metadata.spec;
-		facets = config.plugins.facets;
-		safeNames = Object.create(config.plugins.factories, safeNonFacetNames);
+		facets = plugins.facets;
+		safeNames = Object.create(plugins.factories, safeNonFacetNames);
 		unprocessed = [];
 
 		for(name in spec) {
@@ -1250,7 +2580,7 @@ define('wire/lib/lifecycle',['require','when'],function(require) {
 				if (options) {
 					processStep(promises, facets[name], step, proxy, options, api);
 				}
-			} else if (metadata && !metadata.isPlugin && !(name in safeNames)) {
+			} else if (!(name in safeNames)) {
 				unprocessed.push(name);
 			}
 		}
@@ -1259,16 +2589,13 @@ define('wire/lib/lifecycle',['require','when'],function(require) {
 			return when.reject(unrecognizedFacets(proxy, unprocessed, spec));
 		} else {
 			return when.all(promises).then(function () {
-				return processListeners(step, proxy, api, config);
+				return processListeners(step, proxy, api, plugins.listeners);
 			}).yield(proxy);
 		}
 	}
 
-	function processListeners(step, proxy, api, config) {
-		var listeners, listenerPromises;
-
-		listeners = config.plugins.listeners;
-		listenerPromises = [];
+	function processListeners(step, proxy, api, listeners) {
+		var listenerPromises = [];
 
 		for (var i = 0; i < listeners.length; i++) {
 			processStep(listenerPromises, listeners[i], step, proxy, {}, api);
@@ -1312,9 +2639,7 @@ define('wire/lib/lifecycle',['require','when'],function(require) {
 	// CommonJS
 	: function(factory) { module.exports = factory(require); }
 );
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/*global setTimeout:true, clearTimeout:true*/
+/** @license MIT License (c) copyright 2011-2013 original author or authors */
 
 /**
  * timeout.js
@@ -1322,71 +2647,1632 @@ define('wire/lib/lifecycle',['require','when'],function(require) {
  * Helper that returns a promise that rejects after a specified timeout,
  * if not explicitly resolved or rejected before that.
  *
- * @author brian@hovercraftstudios.com
+ * @author Brian Cavalier
+ * @author John Hann
  */
 
 (function(define) {
-define('when/timeout',['./when'], function(when) {
+define('when/timeout',['require','./when'],function(require) {
+	/*global setTimeout,clearTimeout*/
+    var when, setTimer, cancelTimer, cjsRequire, vertx;
 
-    var undef;
+	when = require('./when');
+	cjsRequire = require;
+
+	try {
+		vertx = cjsRequire('vertx');
+		setTimer = function (f, ms) { return vertx.setTimer(ms, f); };
+		cancelTimer = vertx.cancelTimer;
+	} catch (e) {
+		setTimer = setTimeout;
+		cancelTimer = clearTimeout;
+	}
 
     /**
      * Returns a new promise that will automatically reject after msec if
-     * the supplied promise doesn't resolve or reject before that.
+     * the supplied trigger doesn't resolve or reject before that.
      *
-     * Usage:
-     *
-     * var d = when.defer();
-     * // Setup d however you need
-     *
-     * // return a new promise that will timeout if d doesn't resolve/reject first
-     * return timeout(d.promise, 1000);
-     *
-     * @param promise anything - any promise or value that should trigger
-     *  the returned promise to resolve or reject before the msec timeout
-     * @param msec {Number} timeout in milliseconds
-     *
-     * @returns {Promise}
+	 * @param {number} msec timeout in milliseconds
+     * @param {*|Promise} trigger any promise or value that should trigger the
+	 *  returned promise to resolve or reject before the msec timeout
+     * @returns {Promise} promise that will timeout after msec, or be
+	 *  equivalent to trigger if resolved/rejected before msec
      */
-    return function timeout(promise, msec) {
-        var deferred, timeoutRef;
+    return function timeout(msec, trigger) {
+		// Support reversed, deprecated argument ordering
+		if(typeof trigger === 'number') {
+			var tmp = trigger;
+			trigger = msec;
+			msec = tmp;
+		}
 
-        deferred = when.defer();
+		return when.promise(function(resolve, reject, notify) {
 
-        timeoutRef = setTimeout(function onTimeout() {
-            timeoutRef && deferred.reject(new Error('timed out'));
-        }, msec);
+			var timeoutRef = setTimer(function onTimeout() {
+				reject(new Error('timed out after ' + msec + 'ms'));
+			}, msec);
 
-        function cancelTimeout() {
-            clearTimeout(timeoutRef);
-            timeoutRef = undef;
-        }
-
-        when(promise,
-            function(value) {
-                cancelTimeout();
-                deferred.resolve(value);
-            },
-            function(reason) {
-                cancelTimeout();
-                deferred.reject(reason);
-            }
-        );
-
-        return deferred.promise;
+			when(trigger,
+				function onFulfill(value) {
+					cancelTimer(timeoutRef);
+					resolve(value);
+				},
+				function onReject(reason) {
+					cancelTimer(timeoutRef);
+					reject(reason);
+				},
+				notify
+			);
+		});
     };
+});
+})(
+	typeof define === 'function' && define.amd ? define : function (factory) { module.exports = factory(require); });
+
+
+
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+
+(function(define){ 
+define('wire/lib/resolver',['require','when','when/timeout','./object'],function(require) {
+
+	var when, timeout, object;
+
+	when = require('when');
+	timeout = require('when/timeout');
+	object = require('./object');
+
+	/**
+	 * Create a reference resolve that uses the supplied plugins and pluginApi
+	 * @param {object} config
+	 * @param {object} config.plugins plugin registry
+	 * @param {object} config.pluginApi plugin Api to provide to resolver plugins
+	 *  when resolving references
+	 * @constructor
+	 */
+	function Resolver(resolvers, pluginApi) {
+		this._resolvers = resolvers;
+		this._pluginApi = pluginApi;
+	}
+
+	Resolver.prototype = {
+
+		/**
+		 * Determine if it is a reference spec that can be resolved by this resolver
+		 * @param {*} it
+		 * @return {boolean} true iff it is a reference
+		 */
+		isRef: function(it) {
+			return it && object.hasOwn(it, '$ref');
+		},
+
+		/**
+		 * Parse it, which must be a reference spec, into a reference object
+		 * @param {object|string} it
+		 * @param {string?} it.$ref
+		 * @return {object} reference object
+		 */
+		parse: function(it) {
+			return this.isRef(it)
+				? this.create(it.$ref, it)
+				: this.create(it, {});
+		},
+
+		/**
+		 * Creates a reference object
+		 * @param {string} name reference name
+		 * @param {object} options
+		 * @return {{resolver: String, name: String, options: object, resolve: Function}}
+		 */
+		create: function(name, options) {
+			var self, split, resolver;
+
+			self = this;
+
+			split = name.indexOf('!');
+			resolver = name.substring(0, split);
+			name = name.substring(split + 1);
+
+			return {
+				resolver: resolver,
+				name: name,
+				options: options,
+				resolve: function(fallback, onBehalfOf) {
+					return this.resolver
+						? self._resolve(resolver, name, options, onBehalfOf)
+						: fallback(name, options);
+				}
+			};
+		},
+
+		/**
+		 * Do the work of resolving a reference using registered plugins
+		 * @param {string} resolverName plugin resolver name (e.g. "dom"), the part before the "!"
+		 * @param {string} name reference name, the part after the "!"
+		 * @param {object} options additional options to pass thru to a resolver plugin
+		 * @param {string|*} onBehalfOf some indication of another component on whose behalf this
+		 *  reference is being resolved.  Used to build a reference graph and detect cycles
+		 * @return {object} promise for the resolved reference
+		 * @private
+		 */
+		_resolve: function(resolverName, name, options, onBehalfOf) {
+			var deferred, resolver, api;
+
+			deferred = when.defer();
+
+			if (resolverName) {
+				resolver = this._resolvers[resolverName];
+
+				if (resolver) {
+					api = this._pluginApi.contextualize(onBehalfOf);
+					resolver(deferred.resolver, name, options||{}, api);
+				} else {
+					deferred.reject(new Error('No resolver plugin found: ' + resolverName));
+				}
+
+			} else {
+				deferred.reject(new Error('Cannot resolve ref: ' + name));
+			}
+
+			return deferred.promise;
+		}
+	};
+
+	return Resolver;
 
 });
 })(typeof define == 'function'
-    ? define
-    : function (deps, factory) { typeof module != 'undefined'
-        ? (module.exports = factory(require('./when')))
-        : (this.when_timeout = factory(this.when));
-    }
-    // Boilerplate for AMD, Node, and browser global
+	// AMD
+	? define
+	// CommonJS
+	: function(factory) { module.exports = factory(require); }
+);
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+
+(function(define) { 
+define('wire/lib/plugin/priority',[],function() {
+
+	var basePriority, defaultPriority;
+
+	basePriority = -99;
+	defaultPriority = 0;
+
+	return {
+		basePriority: basePriority,
+		sortReverse: prioritizeReverse
+	};
+
+	function prioritizeReverse(list) {
+		return list.sort(byReversePriority);
+	}
+
+	function byReversePriority(a, b) {
+		var aPriority, bPriority;
+
+		aPriority = a.priority || defaultPriority;
+		bPriority = b.priority || defaultPriority;
+
+		return aPriority < bPriority ? -1
+			: aPriority > bPriority ? 1 : 0;
+	}
+
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(); }));
+
+/** @license MIT License (c) copyright original author or authors */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+
+(function(define){ 
+define('wire/lib/instantiate',[],function() {
+
+	var undef;
+
+	/**
+	 * Creates an object by either invoking ctor as a function and returning the result,
+	 * or by calling new ctor().  It uses a simple heuristic to try to guess which approach
+	 * is the "right" one.
+	 *
+	 * @param ctor {Function} function or constructor to invoke
+	 * @param args {Array} array of arguments to pass to ctor in either case
+	 *
+	 * @return The result of invoking ctor with args, with or without new, depending on
+	 * the strategy selected.
+	 */
+	return function instantiate(ctor, args, forceConstructor) {
+
+		var begotten, ctorResult;
+
+		if (forceConstructor || isConstructor(ctor)) {
+			begotten = Object.create(ctor.prototype);
+			defineConstructorIfPossible(begotten, ctor);
+			ctorResult = ctor.apply(begotten, args);
+			if(ctorResult !== undef) {
+				begotten = ctorResult;
+			}
+
+		} else {
+			begotten = ctor.apply(undef, args);
+
+		}
+
+		return begotten === undef ? null : begotten;
+	};
+
+	/**
+	 * Carefully sets the instance's constructor property to the supplied
+	 * constructor, using Object.defineProperty if available.  If it can't
+	 * set the constructor in a safe way, it will do nothing.
+	 *
+	 * @param instance {Object} component instance
+	 * @param ctor {Function} constructor
+	 */
+	function defineConstructorIfPossible(instance, ctor) {
+		try {
+			Object.defineProperty(instance, 'constructor', {
+				value: ctor,
+				enumerable: false
+			});
+		} catch(e) {
+			// If we can't define a constructor, oh well.
+			// This can happen if in envs where Object.defineProperty is not
+			// available, or when using cujojs/poly or other ES5 shims
+		}
+	}
+
+	/**
+	 * Determines whether the supplied function should be invoked directly or
+	 * should be invoked using new in order to create the object to be wired.
+	 *
+	 * @param func {Function} determine whether this should be called using new or not
+	 *
+	 * @returns {Boolean} true iff func should be invoked using new, false otherwise.
+	 */
+	function isConstructor(func) {
+		var is = false, p;
+		for (p in func.prototype) {
+			if (p !== undef) {
+				is = true;
+				break;
+			}
+		}
+
+		return is;
+	}
+
+});
+})(typeof define == 'function'
+	// AMD
+	? define
+	// CommonJS
+	: function(factory) {
+		module.exports = factory();
+	}
+);
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * plugins
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ * @author: brian@hovercraftstudios.com
+ */
+(function(define) {
+define('wire/lib/plugin/registry',['require','when','../array','../object','./priority','../instantiate'],function(require) {
+
+	var when, array, object, priority, instantiate, nsKey, nsSeparator;
+
+	when = require('when');
+	array = require('../array');
+	object = require('../object');
+	priority = require('./priority');
+	instantiate = require('../instantiate');
+
+	nsKey = '$ns';
+	nsSeparator = ':';
+
+	function PluginRegistry() {
+		this.plugins = [];
+		this._namespaces = {};
+
+		this.contextListeners = [];
+		this.listeners = [];
+		this.proxiers =  [];
+		this.resolvers = {};
+		this.factories = {};
+		this.facets =    {};
+	}
+
+	PluginRegistry.prototype = {
+		scanModule: function (module, spec, namespace) {
+			var self, pluginFactory;
+
+			pluginFactory = discoverPlugin(module);
+
+			if (!allowPlugin(pluginFactory, this.plugins)) {
+				return when.resolve();
+			}
+
+			// Add to singleton plugins list to only allow one instance
+			// of this plugin in the current context.
+			this.plugins.push(pluginFactory);
+
+			// Initialize the plugin for this context
+			self = this;
+			return when(instantiate(pluginFactory, [spec]),
+				function (plugin) {
+					plugin && self.registerPlugin(plugin, namespace || getNamespace(spec));
+				}
+			).yield();
+		},
+
+		registerPlugin: function (plugin, namespace) {
+			addNamespace(namespace, this._namespaces);
+
+			addPlugin(plugin.resolvers, this.resolvers, namespace);
+			addPlugin(plugin.factories, this.factories, namespace);
+			addPlugin(plugin.facets, this.facets, namespace);
+
+			this.listeners.push(plugin);
+			if(plugin.context) {
+				this.contextListeners.push(plugin.context);
+			}
+
+			this._registerProxies(plugin.proxies);
+		},
+
+		_registerProxies: function (proxiesToAdd) {
+			if (!proxiesToAdd) {
+				return;
+			}
+
+			this.proxiers = priority.sortReverse(array.union(this.proxiers, proxiesToAdd));
+		}
+	};
+
+	return PluginRegistry;
+
+	function discoverPlugin(module) {
+		var plugin;
+
+		// Prefer deprecated legacy wire$plugin format over newer
+		// plain function format.
+		// TODO: Remove support for wire$plugin
+		if(typeof module.wire$plugin === 'function') {
+			plugin = module.wire$plugin;
+		} else if(typeof module === 'function') {
+			plugin = module;
+		}
+
+		return plugin;
+	}
+
+	function getNamespace(spec) {
+		var namespace;
+		if(typeof spec === 'object' && nsKey in spec) {
+			// A namespace was provided
+			namespace = spec[nsKey];
+		}
+
+		return namespace;
+	}
+
+	function addNamespace(namespace, namespaces) {
+		if(namespace && namespace in namespaces) {
+			throw new Error('plugin namespace already in use: ' + namespace);
+		} else {
+			namespaces[namespace] = 1;
+		}
+	}
+
+	function allowPlugin(plugin, existing) {
+		return typeof plugin === 'function' && existing.indexOf(plugin) === -1;
+	}
+
+	function addPlugin(src, registry, namespace) {
+		var newPluginName, namespacedName;
+		for (newPluginName in src) {
+			namespacedName = makeNamespace(newPluginName, namespace);
+			if (object.hasOwn(registry, namespacedName)) {
+				throw new Error("Two plugins for same type in scope: " + namespacedName);
+			}
+
+			registry[namespacedName] = src[newPluginName];
+		}
+	}
+
+	function makeNamespace(pluginName, namespace) {
+		return namespace ? (namespace + nsSeparator + pluginName) : pluginName;
+	}
+});
+}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
+
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author brian@hovercraftstudios.com
+ */
+
+(function(define) { 
+define('wire/lib/scope',['require','when','when/sequence','./array','./object','./Map','./loader/adapter','./ComponentFactory','./lifecycle','./resolver','./WireProxy','./plugin/registry'],function(require) {
+
+	var when, defer, sequence, array, object, loader, Map,
+		ComponentFactory, Lifecycle, Resolver, WireProxy, PluginRegistry,
+		undef;
+
+	when = require('when');
+	sequence = require('when/sequence');
+	array = require('./array');
+	object = require('./object');
+	Map = require('./Map');
+	loader = require('./loader/adapter');
+	ComponentFactory = require('./ComponentFactory');
+	Lifecycle = require('./lifecycle');
+	Resolver = require('./resolver');
+	WireProxy = require('./WireProxy');
+	PluginRegistry = require('./plugin/registry');
+
+	defer = when.defer;
+
+	function Scope(parent, options) {
+		this.parent = parent||{};
+		object.mixin(this, options);
+	}
+
+	Scope.prototype = {
+
+		init: function(spec) {
+
+			this._inherit(this.parent);
+			this._init();
+			this._configure();
+
+			return this._startup(spec).yield(this);
+		},
+
+		_inherit: function(parent) {
+
+			this._instanceToProxy = new Map();
+
+			this.instances = this._inheritInstances(parent);
+			this.components = object.inherit(parent.components);
+
+			this.path = this._createPath(this.name, parent.path);
+
+			this.plugins = parent.plugins;
+
+			this.initializers = array.delegate(this.initializers);
+			this.destroyers = array.delegate(this.destroyers);
+			this.postDestroy = array.delegate(this.postDestroy);
+
+			if(!this.moduleLoader) {
+				this.moduleLoader = parent.moduleLoader;
+			}
+		},
+
+		_inheritInstances: function(parent) {
+			return object.inherit(parent.instances);
+		},
+
+		_addDependent: function(dependant, tasks) {
+			return dependant.then(
+				function(dependant) {
+					tasks.push(function() {
+						return dependant.destroy();
+					});
+					return dependant;
+				}
+			);
+
+		},
+
+		_createNestedScope: function(spec) {
+			var options = { createContext: this.createContext };
+			return this._addDependent(
+				new Scope(this, options).init(spec), this.postDestroy);
+		},
+
+		_createChildContext: function(spec, options) {
+			// Create child and arrange for it to be destroyed just before
+			// this scope is destroyed
+			return this._addDependent(
+				this.createContext(spec, this, options), this.destroyers);
+		},
+
+		_init: function() {
+			this._pluginApi = this._initPluginApi();
+		},
+
+		_initPluginApi: function() {
+			// Plugin API
+			// wire() API that is passed to plugins.
+			var self, pluginApi;
+
+			self = this;
+			pluginApi = {};
+
+			pluginApi.contextualize = function(name) {
+				function contextualApi(spec, id) {
+					return self._resolveInstance(self._createComponentDef(id, spec));
+				}
+
+				contextualApi.createChild = self._createChildContext.bind(self);
+				contextualApi.loadModule = self.getModule.bind(self);
+				contextualApi.resolver = self.resolver;
+				contextualApi.addComponent = addComponent;
+				contextualApi.addInstance = addInstance;
+
+				contextualApi.resolveRef = function(ref) {
+					var onBehalfOf = arguments.length > 1 ? arguments[2] : name;
+					return self._resolveRef(ref, onBehalfOf);
+				};
+
+				contextualApi.getProxy = function(nameOrComponent) {
+					var onBehalfOf = arguments.length > 1 ? arguments[2] : name;
+					return self.getProxy(nameOrComponent, onBehalfOf);
+				};
+
+				return contextualApi;
+			};
+
+			return pluginApi;
+
+			function addComponent(component, id) {
+				var def, instance;
+
+				def = self._createComponentDef(id);
+				instance = self.componentFactory.processComponent(def, component);
+
+				return self._makeResolvable(def, instance);
+			}
+
+			function addInstance(instance, id) {
+				self._makeResolvable(self._createComponentDef(id), instance);
+				return when.resolve(instance);
+			}
+		},
+
+		_configure: function() {
+			var plugins, pluginApi;
+
+			plugins = this.plugins;
+			pluginApi = this._pluginApi;
+
+			this.resolver = this._createResolver(plugins, pluginApi);
+			this.componentFactory = this._createComponentFactory(plugins, pluginApi);
+
+			this._destroy = function() {
+				this._destroy = noop;
+
+				return this._executeDestroyers()
+					.then(this._destroyComponents.bind(this))
+					.then(this._releaseResources.bind(this))
+					.then(this._executePostDestroy.bind(this));
+			};
+		},
+
+		_startup: function(spec) {
+			var self = this;
+
+			return this._executeInitializers().then(function() {
+				var parsed = self._parseSpec(spec);
+				return self._createComponents(parsed).then(function() {
+					return self._awaitInstances(parsed);
+				});
+			});
+		},
+
+		destroy: function() {
+			return this._destroy();
+		},
+
+		_destroy: noop,
+
+		_destroyComponents: function() {
+			var instances = this.instances;
+
+			return this.componentFactory.destroy().then(function() {
+				for (var p in instances) {
+					delete instances[p];
+				}
+			});
+		},
+
+		_releaseResources: function() {
+			// Free Objects
+			this.instances = this.components = this.parent
+				= this.resolver = this.componentFactory
+				= this._instanceToProxy = this._pluginApi = this.plugins
+				= undef;
+		},
+
+		getModule: function(moduleId) {
+			return typeof moduleId == 'string'
+				? this.moduleLoader(moduleId)
+				: when.resolve(moduleId);
+		},
+
+		getProxy: function(nameOrInstance, onBehalfOf) {
+			var self = this;
+
+			if(typeof nameOrInstance === 'string') {
+				return this._resolveRefName(nameOrInstance, {}, onBehalfOf)
+					.then(function (instance) {
+						return self._getProxyForInstance(instance);
+					});
+			} else {
+				return self._getProxyForInstance(nameOrInstance);
+			}
+		},
+
+		_getProxyForInstance: function(instance) {
+			var componentFactory = this.componentFactory;
+
+			return getProxyRecursive(this, instance).otherwise(function() {
+				// Last ditch, create a new proxy
+				return componentFactory.createProxy(instance);
+			});
+		},
+
+		_createResolver: function(plugins, pluginApi) {
+			return new Resolver(plugins.resolvers, pluginApi);
+		},
+
+		_createComponentFactory: function(plugins, pluginApi) {
+			var self, factory, init, lifecycle;
+
+			self = this;
+
+			lifecycle = new Lifecycle(plugins, pluginApi);
+			factory = new ComponentFactory(lifecycle, plugins, pluginApi);
+
+			init = factory.initInstance;
+			factory.initInstance = function() {
+				return when(init.apply(factory, arguments), function(proxy) {
+					return self._makeResolvable(proxy.metadata, proxy);
+				});
+			};
+
+			return factory;
+		},
+
+		_executeInitializers: function() {
+			return sequence(this.initializers, this);
+		},
+
+		_executeDestroyers: function() {
+			return sequence(this.destroyers, this);
+		},
+
+		_executePostDestroy: function() {
+			return sequence(this.postDestroy, this);
+		},
+
+		_parseSpec: function(spec) {
+			var instances, components, plugins, id, d;
+
+			instances = this.instances;
+			components = this.components;
+
+			// Setup a promise for each item in this scope
+			for (id in spec) {
+				if(id === '$plugins' || id === 'plugins') {
+					plugins = spec[id];
+				} else if (!object.hasOwn(instances, id)) {
+					// An initializer may have inserted concrete components
+					// into the context.  If so, they override components of the
+					// same name from the input spec
+					d = defer();
+					components[id] = this._createComponentDef(id, spec[id], d.resolver);
+					instances[id] = d.promise;
+				}
+			}
+
+			return {
+				plugins: plugins,
+				components: components,
+				instances: instances
+			};
+		},
+
+		_createComponentDef: function(id, spec, resolver) {
+			return {
+				id: id,
+				spec: spec,
+				path: this._createPath(id, this.path),
+				resolver: resolver
+			};
+		},
+
+		_createComponents: function(parsed) {
+			// Process/create each item in scope and resolve its
+			// promise when completed.
+			var self, components;
+
+			self = this;
+			components = parsed.components;
+			return when.map(Object.keys(components), function(name) {
+				return self._createScopeItem(components[name]);
+			});
+		},
+
+		_awaitInstances: function(parsed) {
+			var instances = parsed.instances;
+			return when.map(Object.keys(instances), function(id) {
+				return instances[id];
+			});
+		},
+
+		_createScopeItem: function(component) {
+			// NOTE: Order is important here.
+			// The object & local property assignment MUST happen before
+			// the chain resolves so that the concrete item is in place.
+			// Otherwise, the whole scope can be marked as resolved before
+			// the final item has been resolved.
+			var self, item;
+
+			self = this;
+			item = this._resolveItem(component).then(function (resolved) {
+				self._makeResolvable(component, resolved);
+				return WireProxy.getTarget(resolved);
+			});
+
+			component.resolver.resolve(item);
+			return item;
+		},
+
+		_makeResolvable: function(component, instance) {
+			var id, inst;
+
+			id = component.id;
+			if(id != null) {
+				inst = WireProxy.getTarget(instance);
+				this.instances[id] = inst;
+				if(component.proxy) {
+					this._instanceToProxy.set(inst, component.proxy);
+				}
+			}
+
+			return instance;
+		},
+
+		_resolveInstance: function(component) {
+			return this._resolveItem(component).then(WireProxy.getTarget);
+		},
+
+		_resolveItem: function(component) {
+			var item, spec;
+
+			spec = component.spec;
+
+			if (this.resolver.isRef(spec)) {
+				// Reference
+				item = this._resolveRef(spec, component.id);
+			} else {
+				// Component
+				item = this._createItem(component);
+			}
+
+			return item;
+		},
+
+		_createItem: function(component) {
+			var created, spec;
+
+			spec = component.spec;
+
+			if (Array.isArray(spec)) {
+				// Array
+				created = this._createArray(component);
+
+			} else if (object.isObject(spec)) {
+				// component spec, create the component
+				created = this._createComponent(component);
+
+			} else {
+				// Plain value
+				created = when.resolve(spec);
+			}
+
+			return created;
+		},
+
+		_createArray: function(component) {
+			var self, id, i;
+
+			self = this;
+			id = component.id;
+			i = 0;
+
+			// Minor optimization, if it's an empty array spec, just return an empty array.
+			return when.map(component.spec, function(item) {
+				var componentDef = self._createComponentDef(id + '[' + (i++) + ']', item);
+				return self._resolveInstance(componentDef);
+			});
+		},
+
+		_createComponent: function(component) {
+			var self = this;
+
+			return this.componentFactory.create(component)
+				.otherwise(function (reason) {
+					if(reason !== component) {
+						throw reason;
+					}
+
+					// No factory found, treat object spec as a nested scope
+					return self._createNestedScope(component.spec)
+						.then(function (childScope) {
+							// TODO: find a lighter weight solution
+							// We're paying the cost of creating a complete scope,
+							// then discarding everything except the instance map.
+							return object.mixin({}, childScope.instances);
+						}
+					);
+				}
+			);
+		},
+
+		_resolveRef: function(ref, onBehalfOf) {
+			var scope;
+
+			ref = this.resolver.parse(ref);
+			scope = onBehalfOf == ref.name && this.parent.instances ? this.parent : this;
+
+			return this._doResolveRef(ref, scope.instances, onBehalfOf);
+		},
+
+		_resolveRefName: function(refName, options, onBehalfOf) {
+			var ref = this.resolver.create(refName, options);
+
+			return this._doResolveRef(ref, this.instances, onBehalfOf);
+		},
+
+		_doResolveRef: function(ref, scope, onBehalfOf) {
+			return ref.resolve(function (name) {
+				return resolveDeepName(name, scope);
+			}, onBehalfOf);
+		},
+
+		_createPath: function(name, basePath) {
+			var path = basePath || this.path;
+			return (path && name) ? (path + '.' + name) : name;
+		}
+	};
+
+	return Scope;
+
+	function resolveDeepName(name, scope) {
+		var parts = name.split('.');
+
+		if(parts.length > 2) {
+			return when.reject(new Error('Only 1 "." is allowed in refs: ' + name));
+		}
+
+		return when.reduce(parts, function(scope, segment) {
+			return segment in scope
+				? scope[segment]
+				: when.reject(new Error('Cannot resolve ref: ' + name));
+		}, scope);
+	}
+
+	function getProxyRecursive(scope, instance) {
+		var proxy;
+
+		if(scope._instanceToProxy) {
+			proxy = scope._instanceToProxy.get(instance);
+		}
+
+		if(!proxy) {
+			if(scope.parent) {
+				return getProxyRecursive(scope.parent, instance);
+			} else {
+				return when.reject(new Error('No proxy found'));
+			}
+		}
+
+		return when.resolve(proxy);
+	}
+
+	function noop() {}
+
+});
+})(typeof define == 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }
+);
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * Plugin that allows wire to be used as a plugin within a wire spec
+ *
+ * wire is part of the cujo.js family of libraries (http://cujojs.com/)
+ *
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+
+(function(define) {
+define('wire/lib/plugin/wirePlugin',['require','when','../object'],function(require) {
+
+	var when, object;
+
+	when = require('when');
+	object = require('../object');
+
+	return function(/* options */) {
+
+		var ready = when.defer();
+
+		return {
+			context: {
+				ready: function(resolver) {
+					ready.resolve();
+					resolver.resolve();
+				}
+			},
+			resolvers: {
+				wire: wireResolver
+			},
+			factories: {
+				wire: wireFactory
+			}
+		};
+
+		/**
+		 * Factory that creates either a child context, or a *function* that will create
+		 * that child context.  In the case that a child is created, this factory returns
+		 * a promise that will resolve when the child has completed wiring.
+		 *
+		 * @param {Object} resolver used to resolve with the created component
+		 * @param {Object} componentDef component spec for the component to be created
+		 * @param {function} wire scoped wire function
+		 */
+		function wireFactory(resolver, componentDef, wire) {
+			var options, module, provide, defer, waitParent, result;
+
+			options = componentDef.options;
+
+			// Get child spec and options
+			if(object.isObject(options) && 'spec' in options) {
+				module = options.spec;
+				waitParent = options.waitParent;
+				defer = options.defer;
+				provide = options.provide;
+			} else {
+				module = options;
+			}
+
+			function init(context) {
+				var initialized;
+
+				if(provide) {
+					initialized = when(wire(provide), function(provides) {
+						object.mixin(context.instances, provides);
+					});
+				}
+
+				return initialized;
+			}
+
+			/**
+			 * Create a child context of the current context
+			 * @param {object?} mixin additional spec to be mixed into
+			 *  the child being wired
+			 * @returns {Promise} promise for child context
+			 */
+			function createChild(/** {Object|String}? */ mixin) {
+				var spec, config;
+
+				spec = mixin ? [].concat(module, mixin) : module;
+				config = { initializers: [init] };
+
+				var child = wire.createChild(spec, config);
+				return defer ? child
+					: when(child, function(child) {
+					return object.hasOwn(child, '$exports') ? child.$exports : child;
+				});
+			}
+
+			if (defer) {
+				// Resolve with the createChild *function* itself
+				// which can be used later to wire the spec
+				result = createChild;
+
+			} else if(waitParent) {
+
+				var childPromise = when(ready.promise, function() {
+					// ensure nothing is passed to createChild here
+					return createChild();
+				});
+
+				result = wrapChild(childPromise);
+
+			} else {
+				result = createChild();
+			}
+
+			resolver.resolve(result);
+		}
+	};
+
+	function wrapChild(promise) {
+		return { promise: promise };
+	}
+
+	/**
+	 * Builtin reference resolver that resolves to the context-specific
+	 * wire function.
+	 */
+	function wireResolver(resolver, _, __, wire) {
+		resolver.resolve(wire.createChild);
+	}
+
+});
+}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
+
+/** @license MIT License (c) copyright 2011-2013 original author or authors */
+
+/**
+ * @author Brian Cavalier
+ * @author John Hann
+ */
+
+(function (define) { 
+define('wire/lib/asap',['require','when'],function (require) {
+
+	var when = require('when');
+
+	/**
+	 * WARNING: This is not the function you're looking for. You
+	 * probably want when().
+	 * This function *conditionally* executes onFulfill synchronously
+	 * if promiseOrValue is a non-promise, or calls when(promiseOrValue,
+	 * onFulfill, onReject) otherwise.
+	 * @return {Promise|*} returns a promise if promiseOrValue is
+	 *  a promise, or the return value of calling onFulfill
+	 *  synchronously otherwise.
+	 */
+	return function asap(promiseOrValue, onFulfill, onReject) {
+		return when.isPromise(promiseOrValue)
+			? when(promiseOrValue, onFulfill, onReject)
+			: onFulfill(promiseOrValue);
+	};
+
+});
+})(typeof define == 'function' && define.amd ? define : function(factory) { module.exports = factory(require); });
+
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * functional
+ * Helper library for working with pure functions in wire and wire plugins
+ *
+ * NOTE: This lib assumes Function.prototype.bind is available
+ *
+ * wire is part of the cujo.js family of libraries (http://cujojs.com/)
+ *
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+(function (define) { 
+define('wire/lib/functional',['require','./asap'],function (require) {
+
+	var asap, slice;
+
+	asap = require('./asap');
+	slice = [].slice;
+
+	/**
+	 * Create a partial function
+	 * @param f {Function}
+	 * @param [args] {*} additional arguments will be bound to the returned partial
+	 * @return {Function}
+	 */
+	function partial(f, args/*...*/) {
+		// Optimization: return f if no args provided
+		if(arguments.length == 1) {
+			return f;
+		}
+
+		args = slice.call(arguments, 1);
+
+		return function() {
+			return f.apply(this, args.concat(slice.call(arguments)));
+		};
+	}
+
+	/**
+	 * Promise-aware function composition. If any function in
+	 * the composition returns a promise, the entire composition
+	 * will be lifted to return a promise.
+	 * @param funcs {Array} array of functions to compose
+	 * @return {Function} composed function
+	 */
+	function compose(funcs) {
+		var first;
+
+		first = funcs[0];
+		funcs = funcs.slice(1);
+
+		return function composed() {
+			var context = this;
+			return funcs.reduce(function(result, f) {
+				return asap(result, function(result) {
+					return f.call(context, result);
+				});
+			}, first.apply(this, arguments));
+		};
+	}
+
+	return {
+		compose: compose,
+		partial: partial
+	};
+
+});
+})(typeof define == 'function'
+	// AMD
+	? define
+	// CommonJS
+	: function(factory) { module.exports = factory(require); }
 );
 
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
 
+/**
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
+ */
+
+(function(define) { 
+define('wire/lib/pipeline',['require','when','./functional'],function(require) {
+
+	var when, compose, pipelineSplitRx;
+
+	when = require('when');
+	compose = require('./functional').compose;
+	pipelineSplitRx = /\s*\|\s*/;
+
+	return function pipeline(proxy, composeString, wire) {
+
+		var bindSpecs, resolveRef, getProxy;
+
+		if(typeof composeString != 'string') {
+			return wire(composeString).then(function(func) {
+				return createProxyInvoker(proxy, func);
+			});
+		}
+
+		bindSpecs = composeString.split(pipelineSplitRx);
+		resolveRef = wire.resolveRef;
+		getProxy = wire.getProxy;
+
+		function createProxyInvoker(proxy, method) {
+			return function() {
+				return proxy.invoke(method, arguments);
+			};
+		}
+
+		function createBound(proxy, bindSpec) {
+			var target, method;
+
+			target = bindSpec.split('.');
+
+			if(target.length > 2) {
+				throw new Error('Only 1 "." is allowed in refs: ' + bindSpec);
+			}
+
+			if(target.length > 1) {
+				method = target[1];
+				target = target[0];
+				if(!target) {
+					return function(target) {
+						return target[method].apply(target, slice.call(arguments, 1));
+					};
+				}
+				return when(getProxy(target), function(proxy) {
+					return createProxyInvoker(proxy, method);
+				});
+			} else {
+				if(proxy && typeof proxy.get(bindSpec) == 'function') {
+					return createProxyInvoker(proxy, bindSpec);
+				} else {
+					return resolveRef(bindSpec);
+				}
+			}
+
+		}
+
+		// First, resolve each transform function, stuffing it into an array
+		// The result of this reduce will an array of concrete functions
+		// Then add the final context[method] to the array of funcs and
+		// return the composition.
+		return when.reduce(bindSpecs, function(funcs, bindSpec) {
+			return when(createBound(proxy, bindSpec), function(func) {
+				funcs.push(func);
+				return funcs;
+			});
+		}, []).then(
+			function(funcs) {
+				var context = proxy && proxy.target;
+				return (funcs.length == 1 ? funcs[0] : compose(funcs)).bind(context);
+			}
+		);
+	};
+
+});
+}(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(require); }));
+
+(function(define) {
+define('wire/lib/invoker',[],function() {
+
+	return function(methodName, args) {
+		return function(target) {
+			return target[methodName].apply(target, args);
+		};
+	};
+
+});
+})(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(); });
+/** @license MIT License (c) copyright B Cavalier & J Hann */
+
+/**
+ * Base wire plugin that provides properties, init, and destroy facets, and
+ * a proxy for plain JS objects.
+ *
+ * wire is part of the cujo.js family of libraries (http://cujojs.com/)
+ *
+ * Licensed under the MIT License at:
+ * http://www.opensource.org/licenses/mit-license.php
+ */
+
+(function(define) { 
+define('wire/lib/plugin/basePlugin',['require','when','../object','../functional','../pipeline','../instantiate','../invoker'],function(require) {
+
+	var when, object, functional, pipeline, instantiate, createInvoker,
+		whenAll, obj, pluginInstance, undef;
+
+	when = require('when');
+	object = require('../object');
+	functional = require('../functional');
+	pipeline = require('../pipeline');
+	instantiate = require('../instantiate');
+	createInvoker = require('../invoker');
+
+	whenAll = when.all;
+
+	obj = {};
+
+	function asArray(it) {
+		return Array.isArray(it) ? it : [it];
+	}
+
+	function invoke(func, proxy, args, wire) {
+        return when(wire(args, func, proxy.path),
+			function (resolvedArgs) {
+				return proxy.invoke(func, asArray(resolvedArgs));
+			}
+		);
+	}
+
+	function invokeAll(facet, wire) {
+		var options = facet.options;
+
+		if(typeof options == 'string') {
+			return invoke(options, facet, [], wire);
+
+		} else {
+			var promises, funcName;
+			promises = [];
+
+			for(funcName in options) {
+				promises.push(invoke(funcName, facet, options[funcName], wire));
+			}
+
+			return whenAll(promises);
+		}
+	}
+
+	//
+	// Mixins
+	//
+
+	function mixin(target, src) {
+		var name, s;
+
+		for(name in src) {
+			s = src[name];
+			if(!(name in target) || (target[name] !== s && (!(name in obj) || obj[name] !== s))) {
+				target[name] = s;
+			}
+		}
+
+		return target;
+	}
+
+	function doMixin(target, introduction, wire) {
+		introduction = typeof introduction == 'string'
+			? wire.resolveRef(introduction)
+			: wire(introduction);
+
+		return when(introduction, mixin.bind(null, target));
+	}
+
+	function mixinFacet(resolver, facet, wire) {
+		var target, intros;
+
+		target = facet.target;
+		intros = facet.options;
+
+		if(!Array.isArray(intros)) {
+			intros = [intros];
+		}
+
+		resolver.resolve(when.reduce(intros, function(target, intro) {
+			return doMixin(target, intro, wire);
+		}, target));
+	}
+
+    /**
+     * Factory that handles cases where you need to create an object literal
+     * that has a property whose name would trigger another wire factory.
+     * For example, if you need an object literal with a property named "create",
+     * which would normally cause wire to try to construct an instance using
+     * a constructor or other function, and will probably result in an error,
+     * or an unexpected result:
+     * myObject: {
+     *      create: "foo"
+     *    ...
+     * }
+     *
+     * You can use the literal factory to force creation of an object literal:
+     * myObject: {
+     *    literal: {
+     *      create: "foo"
+     *    }
+     * }
+     *
+     * which will result in myObject.create == "foo" rather than attempting
+     * to create an instance of an AMD module whose id is "foo".
+     */
+	function literalFactory(resolver, spec /*, wire */) {
+		resolver.resolve(spec.options);
+	}
+
+	/**
+	 * @deprecated Use create (instanceFactory) instead
+	 * @param resolver
+	 * @param componentDef
+	 * @param wire
+	 */
+	function protoFactory(resolver, componentDef, wire) {
+		var parentRef, promise;
+
+        parentRef = componentDef.options;
+
+        promise = typeof parentRef === 'string'
+                ? wire.resolveRef(parentRef)
+                : wire(parentRef);
+
+		resolver.resolve(promise.then(Object.create));
+	}
+
+	function propertiesFacet(resolver, facet, wire) {
+
+		var properties, path, setProperty, propertiesSet;
+
+		properties = facet.options;
+		path = facet.path;
+		setProperty = facet.set.bind(facet);
+
+		propertiesSet = when.map(Object.keys(facet.options), function(key) {
+			return wire(properties[key], facet.path)
+				.then(function(wiredProperty) {
+					setProperty(key, wiredProperty);
+				}
+			);
+		});
+
+		resolver.resolve(propertiesSet);
+	}
+
+	function invokerFactory(resolver, componentDef, wire) {
+
+		var invoker = wire(componentDef.options).then(function (invokerContext) {
+			// It'd be nice to use wire.getProxy() then proxy.invoke()
+			// here, but that means the invoker must always return
+			// a promise.  Not sure that's best, so for now, just
+			// call the method directly
+			return createInvoker(invokerContext.method, invokerContext.args);
+		});
+
+		resolver.resolve(invoker);
+	}
+
+	function invokerFacet(resolver, facet, wire) {
+		resolver.resolve(invokeAll(facet, wire));
+	}
+
+    //noinspection JSUnusedLocalSymbols
+    /**
+     * Wrapper for use with when.reduce that calls the supplied destroyFunc
+     * @param [unused]
+     * @param destroyFunc {Function} destroy function to call
+     */
+    function destroyReducer(unused, destroyFunc) {
+        return destroyFunc();
+    }
+
+	function cloneFactory(resolver, componentDef, wire) {
+		var sourceRef, options, cloned;
+
+		if (wire.resolver.isRef(componentDef.options.source)) {
+			sourceRef = componentDef.options.source;
+			options = componentDef.options;
+		}
+		else {
+			sourceRef = componentDef.options;
+			options = {};
+		}
+
+		cloned = wire(sourceRef).then(function (ref) {
+			return when(wire.getProxy(ref), function (proxy) {
+				if (!proxy.clone) {
+					throw new Error('No clone function found for ' + componentDef.id);
+				}
+
+				return proxy.clone(options);
+			});
+		});
+
+		resolver.resolve(cloned);
+	}
+
+	function moduleFactory(resolver, componentDef, wire) {
+		resolver.resolve(wire.loadModule(componentDef.options));
+	}
+
+	/**
+	 * Factory that uses an AMD module either directly, or as a
+	 * constructor or plain function to create the resulting item.
+	 *
+	 * @param {Object} resolver resolver to resolve with the created component
+	 * @param {Object} componentDef portion of the spec for the component to be created
+	 * @param {function} wire
+	 */
+	function instanceFactory(resolver, componentDef, wire) {
+		var create, args, isConstructor, module, instance;
+
+		create = componentDef.options;
+
+		if (typeof create == 'string') {
+			module = wire.loadModule(create);
+		} else if(wire.resolver.isRef(create)) {
+			module = wire(create);
+		} else if(object.isObject(create) && create.module) {
+			module = wire.loadModule(create.module);
+			args = create.args ? wire(asArray(create.args)) : [];
+			isConstructor = create.isConstructor;
+		} else {
+			module = create;
+		}
+
+		instance = when.join(module, args).spread(createInstance);
+
+		resolver.resolve(instance);
+
+		// Load the module, and use it to create the object
+		function createInstance(module, args) {
+			// We'll either use the module directly, or we need
+			// to instantiate/invoke it.
+			return typeof module == 'function'
+				? instantiate(module, args, isConstructor)
+				: Object.create(module);
+		}
+	}
+
+	function composeFactory(resolver, componentDef, wire) {
+		var options, promise;
+
+		options = componentDef.options;
+
+		if(typeof options == 'string') {
+			promise = pipeline(undef, options, wire);
+		} else {
+			// Assume it's an array of things that will wire to functions
+			promise = when(wire(options), function(funcArray) {
+				return functional.compose(funcArray);
+			});
+		}
+
+		resolver.resolve(promise);
+	}
+
+	pluginInstance = {
+		factories: {
+			module: moduleFactory,
+			create: instanceFactory,
+			literal: literalFactory,
+			prototype: protoFactory,
+			clone: cloneFactory,
+			compose: composeFactory,
+			invoker: invokerFactory
+		},
+		facets: {
+			// properties facet.  Sets properties on components
+			// after creation.
+			properties: {
+				configure: propertiesFacet
+			},
+			mixin: {
+				configure: mixinFacet
+			},
+			// init facet.  Invokes methods on components during
+			// the "init" stage.
+			init: {
+				initialize: invokerFacet
+			},
+			// ready facet.  Invokes methods on components during
+			// the "ready" stage.
+			ready: {
+				ready: invokerFacet
+			},
+			// destroy facet.  Registers methods to be invoked
+			// on components when the enclosing context is destroyed
+			destroy: {
+				destroy: invokerFacet
+			}
+		}
+	};
+
+	// "introduce" is deprecated, but preserved here for now.
+	pluginInstance.facets.introduce = pluginInstance.facets.mixin;
+
+	return function(/* options */) {
+		return pluginInstance;
+	};
+});
+})(typeof define == 'function'
+	? define
+	: function(factory) { module.exports = factory(require); }
+);
+
+/**
+ * defaultPlugins
+ * @author: brian
+ */
+(function(define) {
+define('wire/lib/plugin/defaultPlugins',['require','./wirePlugin','./basePlugin'],function(require) {
+
+	return [
+		require('./wirePlugin'),
+		require('./basePlugin')
+	];
+
+});
+}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
 
 /** @license MIT License (c) copyright B Cavalier & J Hann */
 
@@ -1627,7 +4513,7 @@ define('wire/lib/graph/formatCycles',[],function() {
  * @author: brian@hovercraftstudios.com
  */
 (function(define) {
-define('wire/lib/graph/trackInflightRef',['require','when/timeout','./tarjan','./formatCycles'],function(require) {
+define('wire/lib/graph/trackInflightRefs',['require','when/timeout','./tarjan','./formatCycles'],function(require) {
 
 	var timeout, findStronglyConnected, formatCycles, refCycleCheckTimeout;
 
@@ -1638,23 +4524,58 @@ define('wire/lib/graph/trackInflightRef',['require','when/timeout','./tarjan','.
 	refCycleCheckTimeout = 5000;
 
 	/**
+	 * Advice to track inflight refs using a directed graph
+	 * @param {DirectedGraph} graph
+	 * @param {Resolver} resolver
+	 * @param {number} cycleTimeout how long to wait for any one reference to resolve
+	 *  before performing cycle detection. This basically debounces cycle detection
+	 */
+	return function trackInflightRefs(graph, resolver, cycleTimeout) {
+		var create = resolver.create;
+
+		if(typeof cycleTimeout != 'number') {
+			cycleTimeout = refCycleCheckTimeout;
+		}
+
+		resolver.create = function() {
+			var ref, resolve;
+
+			ref = create.apply(resolver, arguments);
+
+			resolve = ref.resolve;
+			ref.resolve = function() {
+				var inflight = resolve.apply(ref, arguments);
+				return trackInflightRef(graph, cycleTimeout, inflight, ref.name, arguments[1]);
+			};
+
+			return ref;
+		};
+
+		return resolver;
+	};
+
+
+	/**
 	 * Add this reference to the reference graph, and setup a timeout that will fire if the refPromise
 	 * has not resolved in a reasonable amount.  If the timeout fires, check the current graph for cycles
 	 * and fail wiring if we find any.
-	 * @param {object} refPromise promise for reference resolution
 	 * @param {DirectedGraph} refGraph graph to use to track cycles
+	 * @param {number} cycleTimeout how long to wait for any one reference to resolve
+	 *  before performing cycle detection. This basically debounces cycle detection
+	 * @param {object} refPromise promise for reference resolution
 	 * @param {string} refName reference being resolved
 	 * @param {string} onBehalfOf some indication of another component on whose behalf this
 	 *  reference is being resolved.  Used to build a reference graph and detect cycles
 	 * @return {object} promise equivalent to refPromise but that may be rejected if cycles are detected
 	 */
-	return function trackInflightRef(refGraph, refPromise, refName, onBehalfOf) {
+	function trackInflightRef(refGraph, cycleTimeout, refPromise, refName, onBehalfOf) {
 
-		refGraph.addEdge(onBehalfOf||'?', refName);
+		onBehalfOf = onBehalfOf||'?';
+		refGraph.addEdge(onBehalfOf, refName);
 
-		return timeout(refPromise, refCycleCheckTimeout).then(
+		return timeout(refPromise, cycleTimeout).then(
 			function(resolved) {
-				refGraph.removeEdge(onBehalfOf||'?', refName);
+				refGraph.removeEdge(onBehalfOf, refName);
 				return resolved;
 			},
 			function() {
@@ -1687,1816 +4608,202 @@ define('wire/lib/graph/trackInflightRef',['require','when/timeout','./tarjan','.
  */
 
 (function(define){ 
-define('wire/lib/resolver',['require','when','when/timeout','./object','./graph/DirectedGraph','./graph/trackInflightRef'],function(require) {
+define('wire/lib/Container',['require','when','./advice','./object','./WireContext','./scope','./plugin/registry','./plugin/defaultPlugins','./graph/DirectedGraph','./graph/trackInflightRefs'],function(require) {
 
-	var when, timeout, object, DirectedGraph, trackInflightRef;
+	var when, advice, object, WireContext, Scope,
+		PluginRegistry, defaultPlugins,
+		DirectedGraph, trackInflightRefs, slice, scopeProto, undef;
 
 	when = require('when');
-	timeout = require('when/timeout');
+	advice = require('./advice');
 	object = require('./object');
+	WireContext = require('./WireContext');
+	Scope = require('./scope');
+	PluginRegistry = require('./plugin/registry');
+	defaultPlugins = require('./plugin/defaultPlugins');
 	DirectedGraph = require('./graph/DirectedGraph');
-	trackInflightRef = require('./graph/trackInflightRef');
+	trackInflightRefs = require('./graph/trackInflightRefs');
+	slice = Array.prototype.slice;
 
-	/**
-	 * Create a reference resolve that uses the supplied plugins and pluginApi
-	 * @param {object} config
-	 * @param {object} config.plugins plugin registry
-	 * @param {object} config.pluginApi plugin Api to provide to resolver plugins
-	 *  when resolving references
-	 * @constructor
-	 */
-	function Resolver(config) {
-		this._resolvers = config.plugins.resolvers;
-		this._pluginApi = config.pluginApi;
+	scopeProto = Scope.prototype;
 
-		// Directed graph to track reference cycles
-		// Should be injected, but for now, we'll just create it here
-		// TODO: Hoist to config or another constructor arg
-		this._trackInflightRef = trackInflightRef.bind(null, new DirectedGraph());
+	function Container() {
+		Scope.apply(this, arguments);
 	}
 
-	Resolver.prototype = {
-
-		/**
-		 * Determine if it is a reference spec that can be resolved by this resolver
-		 * @param {*} it
-		 * @return {boolean} true iff it is a reference
-		 */
-		isRef: function(it) {
-			return it && object.hasOwn(it, '$ref');
-		},
-
-		/**
-		 * Parse it, which must be a reference spec, into a reference object
-		 * @param {object|string} it
-		 * @param {string?} it.$ref
-		 * @return {object} reference object
-		 */
-		parse: function(it) {
-			return this.isRef(it)
-				? this.create(it.$ref, it)
-				: this.create(it, {});
-		},
-
-		/**
-		 * Creates a reference object
-		 * @param {string} name reference name
-		 * @param {object} options
-		 * @return {{resolver: String, name: String, options: object, resolve: Function}}
-		 */
-		create: function(name, options) {
-			var self, split, resolver, trackRef;
-
-			self = this;
-
-			split = name.indexOf('!');
-			resolver = name.substring(0, split);
-			name = name.substring(split + 1);
-			trackRef = this._trackInflightRef;
-
-			return {
-				resolver: resolver,
-				name: name,
-				options: options,
-				resolve: function(fallback, onBehalfOf) {
-					var ref = this.resolver
-						? self._resolve(resolver, name, options, onBehalfOf)
-						: fallback(name, options);
-
-					return trackRef(ref, name, onBehalfOf);
-				}
+	/**
+	 * Container inherits from Scope, adding plugin support and
+	 * context level events.
+	 */
+	Container.prototype = object.extend(scopeProto, {
+		_inheritInstances: function(parent) {
+			var publicApi = {
+				wire: this._createChildContext.bind(this),
+				destroy: this.destroy.bind(this),
+				resolve: this._resolveRef.bind(this)
 			};
+
+			return WireContext.inherit(parent.instances, publicApi);
 		},
 
-		/**
-		 * Do the work of resolving a reference using registered plugins
-		 * @param {string} resolverName plugin resolver name (e.g. "dom"), the part before the "!"
-		 * @param {string} name reference name, the part after the "!"
-		 * @param {object} options additional options to pass thru to a resolver plugin
-		 * @param {string|*} onBehalfOf some indication of another component on whose behalf this
-		 *  reference is being resolved.  Used to build a reference graph and detect cycles
-		 * @return {object} promise for the resolved reference
-		 * @private
-		 */
-		_resolve: function(resolverName, name, options, onBehalfOf) {
-			var deferred, resolver, api;
+		_init: advice.after(
+			scopeProto._init,
+			function() {
+				this.plugins = new PluginRegistry();
+				return this._installDefaultPlugins();
+			}
+		),
 
-			deferred = when.defer();
+		_startup: advice.after(
+			scopeProto._startup,
+			function(started) {
+				var self = this;
+				return when.resolve(started).otherwise(function(e) {
+					return self._contextEvent('error', e).yield(started);
+				});
+			}
+		),
 
-			if (resolverName) {
-				resolver = this._resolvers[resolverName];
+		_installDefaultPlugins: function() {
+			return this._installPlugins(defaultPlugins);
+		},
 
-				if (resolver) {
-					api = this._pluginApi.contextualize(onBehalfOf);
-					resolver(deferred.resolver, name, options||{}, api);
-				} else {
-					deferred.reject(new Error('No resolver plugin found: ' + resolverName));
-				}
-
-			} else {
-				deferred.reject(new Error('Cannot resolve ref: ' + name));
+		_installPlugins: function(plugins) {
+			if(!plugins) {
+				return when.resolve();
 			}
 
-			return deferred.promise;
-		}
-	};
+			var self, registry, installed;
 
-	return Resolver;
+			self = this;
+			registry = this.plugins;
 
-});
-})(typeof define == 'function'
-	// AMD
-	? define
-	// CommonJS
-	: function(factory) { module.exports = factory(require); }
-);
-/** @license MIT License (c) copyright B Cavalier & J Hann */
+			if(Array.isArray(plugins)) {
+				installed = plugins.map(function(plugin) {
+					return installPlugin(plugin);
+				});
+			} else {
+				installed = Object.keys(plugins).map(function(namespace) {
+					return installPlugin(plugins[namespace], namespace);
+				});
+			}
 
-/**
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- */
+			return when.all(installed);
 
-(function(define){ 
-define('wire/lib/proxy',['require','./object','./array'],function(require) {
+			function installPlugin(pluginSpec, namespace) {
+				var module, t;
 
-	var object, array;
-	
-	object = require('./object');
-	array = require('./array');
+				t = typeof pluginSpec;
+				if(t == 'string') {
+					module = pluginSpec;
+					pluginSpec = {};
+				} else if(typeof pluginSpec.module == 'string') {
+					module = pluginSpec.module;
+				} else {
+					module = pluginSpec;
+				}
 
-	/**
-	 * A base proxy for all components that wire creates.  It allows wire's
-	 * internals and plugins to work with components using a standard interface.
-	 * WireProxy instances may be extended to specialize the behavior of the
-	 * interface for a particular type of component.  For example, there is a
-	 * specialized version for DOM Nodes.
-	 * @param {*} target value to be proxied
-	 * @param {Lifecycle} lifecycle lifecycle processor for the target component
-	 * @param {Object} metadata metadata that was used to create the target component
-	 *  instance being proxied
-	 * @constructor
-	 */
-	function WireProxy(target, lifecycle, metadata) {
-		this.id = metadata && metadata.id;
-		this.target = target;
-		this.metadata = metadata;
-
-		Object.defineProperty(this, '_lifecycle', { value: lifecycle });
-	}
-
-	WireProxy.prototype = Object.create({
-		init: function () {
-			return this._lifecycle.init(this);
+				return self.getModule(module).then(function(plugin) {
+					return registry.scanModule(plugin, pluginSpec, namespace);
+				});
+			}
 		},
 
-		startup: function () {
-			return this._lifecycle.startup(this);
+		_createResolver: advice.after(
+			scopeProto._createResolver,
+			function(resolver) {
+				return trackInflightRefs(
+					new DirectedGraph(), resolver, this.refCycleTimeout);
+			}
+		),
+
+		_contextEvent: function (type, data) {
+			var api, listeners;
+
+			if(!this.contextEventApi) {
+				this.contextEventApi = this._pluginApi.contextualize(this.path);
+			}
+
+			api = this.contextEventApi;
+			listeners = this.plugins.contextListeners;
+
+			return when.reduce(listeners, function(undef, listener) {
+				var d;
+
+				if(listener[type]) {
+					d = when.defer();
+					listener[type](d.resolver, api, data);
+					return d.promise;
+				}
+
+				return undef;
+			}, undef);
 		},
 
-		shutdown: function () {
-			return this._lifecycle.shutdown(this);
-		},
+		_createComponents: advice.beforeAsync(
+			scopeProto._createComponents,
+			function(parsed) {
+				var self = this;
+				return this._installPlugins(parsed.plugins)
+					.then(function() {
+						return self._contextEvent('initialize');
+					});
+			}
+		),
 
-		destroy: function () {}
+		_awaitInstances: advice.afterAsync(
+			scopeProto._awaitInstances,
+			function() {
+				return this._contextEvent('ready');
+			}
+		),
+
+		_destroyComponents: advice.beforeAsync(
+			scopeProto._destroyComponents,
+			function() {
+				return this._contextEvent('shutdown');
+			}
+		),
+
+		_releaseResources: advice.beforeAsync(
+			scopeProto._releaseResources,
+			function() {
+				return this._contextEvent('destroy');
+			}
+		)
 	});
 
-	WireProxy.prototype.get = function (property) {
-		return this.target[property];
-	};
-
-	WireProxy.prototype.set = function (property, value) {
-		this.target[property] = value;
-		return value;
-	};
-
-	WireProxy.prototype.invoke = function (method, args) {
-		var target = this.target;
-
-		if (typeof method === 'string') {
-			method = target[method];
-		}
-
-		return method.apply(target, array.fromArguments(args));
-	};
-
-	WireProxy.prototype.clone = function (options) {
-		// don't try to clone a primitive
-		var target = this.target;
-
-		if (typeof target == 'function') {
-			// cloneThing doesn't clone functions, so clone here:
-			return target.bind();
-		} else if (typeof target != 'object') {
-			return target;
-		}
-
-		return cloneThing(target, options || {});
-	};
-
-	return {
-		create: createProxy,
-		isProxy: isProxy,
-		getTarget: getTarget,
-		extend: extendProxy
-	};
-
-	/**
-	 * Creates a new WireProxy for the supplied target. See WireProxy
-	 * @param {*} target value to be proxied
-	 * @param {Lifecycle} lifecycle lifecycle processor for the target component
-	 * @param {Object} metadata metadata that was used to create the target component
-	 *  instance being proxied
-	 * @returns {WireProxy}
-	 */
-	function createProxy(target, lifecycle, metadata) {
-		return new WireProxy(target, lifecycle, metadata);
-	}
-
-	/**
-	 * Returns a new WireProxy, whose prototype is proxy, with extensions
-	 * as own properties.  This is the "official" way to extend the functionality
-	 * of an existing WireProxy.
-	 * @param {WireProxy} proxy proxy to extend
-	 * @param extensions
-	 * @returns {*}
-	 */
-	function extendProxy(proxy, extensions) {
-		return object.mixin(Object.create(proxy), extensions);
-	}
-
-	/**
-	 * Returns true if it is a WireProxy
-	 * @param {*} it
-	 * @returns {boolean}
-	 */
-	function isProxy(it) {
-		return it instanceof WireProxy;
-	}
-
-	/**
-	 * If it is a WireProxy (see isProxy), returns it's target.  Otherwise,
-	 * returns it;
-	 * @param {*} it
-	 * @returns {*}
-	 */
-	function getTarget(it) {
-		return isProxy(it) ? it.target : it;
-	}
-
-	function cloneThing (thing, options) {
-		var deep, inherited, clone, prop;
-		deep = options.deep;
-		inherited = options.inherited;
-
-		// Note: this filters out primitive properties and methods
-		if (typeof thing != 'object') {
-			return thing;
-		}
-		else if (thing instanceof Date) {
-			return new Date(thing.getTime());
-		}
-		else if (thing instanceof RegExp) {
-			return new RegExp(thing);
-		}
-		else if (Array.isArray(thing)) {
-			return deep
-				? thing.map(function (i) { return cloneThing(i, options); })
-				: thing.slice();
-		}
-		else {
-			clone = thing.constructor ? new thing.constructor() : {};
-			for (prop in thing) {
-				if (inherited || object.hasOwn(thing, prop)) {
-					clone[prop] = deep
-						? cloneThing(thing[prop], options)
-						: thing[prop];
-				}
-			}
-			return clone;
-		}
-	}
-
-});
-})(typeof define == 'function'
-	// AMD
-	? define
-	// CommonJS
-	: function(factory) { module.exports = factory(require); }
-);
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/**
- * plugins
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- * @author: brian@hovercraftstudios.com
- */
-(function(define) {
-define('wire/lib/plugin/registry',['require','when','../array','../object'],function(require) {
-
-	var when, array, object, nsKey, nsSeparator;
-
-	when = require('when');
-	array = require('../array');
-	object = require('../object');
-
-	nsKey = '$ns';
-	nsSeparator = ':';
-
-	var registry = {
-		isPlugin: isPlugin,
-
-		scanModule: function(module, spec) {
-			var self;
-
-			if (allowPlugin(module, this.plugins)) {
-				// Add to singleton plugins list to only allow one instance
-				// of this plugin in the current context.
-				this.plugins.push(module.wire$plugin);
-
-				// Initialize the plugin for this context
-				self = this;
-				return when(module.wire$plugin(this.scopeReady, this.scopeDestroyed, spec),
-					function(plugin) {
-						var namespace = getNamespace(spec, self._namespaces);
-						plugin && self.registerPlugin(plugin, namespace);
-					}
-				).yield(module);
-			}
-
-			return module;
-		},
-
-		registerPlugin: function(plugin, namespace) {
-			addPlugin(plugin.resolvers, this.resolvers, namespace);
-			addPlugin(plugin.factories, this.factories, namespace);
-			addPlugin(plugin.facets, this.facets, namespace);
-
-			this.listeners.push(plugin);
-
-			this._registerProxies(plugin.proxies);
-		},
-
-		_registerProxies: function(proxiesToAdd) {
-			if (!proxiesToAdd) {
-				return;
-			}
-
-			var proxiers = this.proxiers;
-
-			proxiesToAdd.forEach(function(p) {
-				if (proxiers.indexOf(p) < 0) {
-					proxiers.unshift(p);
-				}
-			});
-		}
-	};
-
-	return createRegistry;
-
-	function createRegistry(parent, ready, destroyed) {
-		return Object.create(registry, {
-			scopeReady: { value: ready },
-			scopeDestroyed: { value: destroyed },
-
-			plugins:   { value: [] },
-			_namespaces: { value: {} },
-
-			listeners: { value: array.delegate(parent.listeners) },
-			proxiers:  { value: array.delegate(parent.proxiers) },
-			resolvers: { value: object.inherit(parent.resolvers) },
-			factories: { value: object.inherit(parent.factories) },
-			facets:    { value: object.inherit(parent.facets) }
-		});
-	}
-
-	function getNamespace(spec, namespaces) {
-		var namespace;
-		if(typeof spec === 'object' && nsKey in spec) {
-			// A namespace was provided
-			namespace = spec[nsKey];
-			if(namespace && namespace in namespaces) {
-				throw new Error('plugin namespace already in use: ' + namespace);
-			} else {
-				namespaces[namespace] = 1;
-			}
-		}
-
-		return namespace;
-	}
-
-	function allowPlugin(module, existing) {
-		return isPlugin(module) && existing.indexOf(module.wire$plugin) === -1;
-	}
-
-	function isPlugin(module) {
-		return module && typeof module.wire$plugin == 'function'
-	}
-
-	function addPlugin(src, registry, namespace) {
-		var newPluginName, namespacedName;
-		for (newPluginName in src) {
-			namespacedName = makeNamespace(newPluginName, namespace);
-			if (object.hasOwn(registry, namespacedName)) {
-				throw new Error("Two plugins for same type in scope: " + namespacedName);
-			}
-
-			registry[namespacedName] = src[newPluginName];
-		}
-	}
-
-	function makeNamespace(pluginName, namespace) {
-		return namespace ? (namespace + nsSeparator + pluginName) : pluginName;
-	}
-});
-}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
-
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/**
- * Plugin that allows wire to be used as a plugin within a wire spec
- *
- * wire is part of the cujo.js family of libraries (http://cujojs.com/)
- *
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- */
-
-(function(define) {
-define('wire/lib/plugin/wirePlugin',['require','when','../async','../object'],function(require) {
-
-	var when, async, object;
-
-	when = require('when');
-	async = require('../async');
-	object = require('../object');
-
-	return {
-		wire$plugin: function(ready) {
-
-			return {
-				resolvers: {
-					wire: wireResolver
-				},
-				factories: {
-					wire: wireFactory
-				}
-			};
-
-			/**
-			 * Factory that creates either a child context, or a *function* that will create
-			 * that child context.  In the case that a child is created, this factory returns
-			 * a promise that will resolve when the child has completed wiring.
-			 *
-			 * @param {Object} resolver used to resolve with the created component
-			 * @param {Object} componentDef component spec for the component to be created
-			 * @param {function} wire scoped wire function
-			 */
-			function wireFactory(resolver, componentDef, wire) {
-				//
-				// TODO: Move wireFactory to its own module
-				//
-				var options, module, provide, defer, waitParent, result;
-
-				options = componentDef.options;
-
-				// Get child spec and options
-				if(options && 'spec' in options) {
-					module = options.spec;
-					waitParent = options.waitParent;
-					defer = options.defer;
-					provide = options.provide;
-				} else {
-					module = options;
-				}
-
-				function init(context) {
-					var initialized;
-
-					if(provide) {
-						initialized = when(wire(provide), function(provides) {
-							object.mixin(context.components, provides);
-						});
-					}
-
-					return initialized;
-				}
-
-				function createChild(/** {Object|String}? */ mixin) {
-					var spec, config;
-
-					spec = mixin ? [].concat(module, mixin) : module;
-					config = { contextHandlers: { init: init } };
-
-					var child = wire.createChild(spec, config);
-					return defer ? child
-						: when(child, function(child) {
-						return object.hasOwn(child, '$exports') ? child.$exports : child;
-					});
-				}
-
-				if (defer) {
-					// Resolve with the createChild *function* itself
-					// which can be used later to wire the spec
-					result = createChild;
-
-				} else if(waitParent) {
-
-					var childPromise = when(ready, function() {
-						// ensure nothing is passed to createChild here
-						return createChild();
-					});
-
-					result = async.wrapValue(childPromise);
-
-				} else {
-					result = createChild(componentDef.spec);
-				}
-
-				resolver.resolve(result);
-			}
-		}
-	};
-
-	/**
-	 * Builtin reference resolver that resolves to the context-specific
-	 * wire function.
-	 */
-	function wireResolver(resolver, _, __, wire) {
-		resolver.resolve(wire.createChild);
-	}
+	return Container;
 
 });
 }(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
 
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/**
- * functional
- * Helper library for working with pure functions in wire and wire plugins
- *
- * NOTE: This lib assumes Function.prototype.bind is available
- *
- * wire is part of the cujo.js family of libraries (http://cujojs.com/)
- *
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- */
-(function (define) { 
-define('wire/lib/functional',['require','when'],function (require) {
-
-	var when, slice;
-
-	when = require('when');
-	slice = [].slice;
-
-	/**
-	 * Create a partial function
-	 * @param f {Function}
-	 * @param [args] {*} additional arguments will be bound to the returned partial
-	 * @return {Function}
-	 */
-	function partial(f, args/*...*/) {
-		// What we want here is to allow the partial function to be called in
-		// any context, by attaching it to an object, or using partialed.call/apply
-		// That's why we're not using Function.bind() here.  It has no way to bind
-		// arguments but allow the context to default.  In other words, you MUST bind
-		// the the context to something with Function.bind().
-
-		// Optimization: return f if no args provided
-		if(arguments.length == 1) {
-			return f;
-		}
-
-		args = slice.call(arguments, 1);
-
-		return function() {
-			return f.apply(this, args.concat(slice.call(arguments)));
-		};
-	}
-
-	/**
-	 * Compose functions
-	 * @param funcs {Array} array of functions to compose
-	 * @return {Function} composed function
-	 */
-	function compose(funcs) {
-
-		var first;
-		first = funcs[0];
-		funcs = funcs.slice(1);
-
-		return function composed() {
-			var context = this;
-			return funcs.reduce(function(result, f) {
-				return conditionalWhen(result, function(result) {
-					return f.call(context, result);
-				});
-			}, first.apply(this, arguments));
-		};
-	}
-
-	/**
-	 * Parses the function composition string, resolving references as needed, and
-	 * composes a function from the resolved refs.
-	 * @param proxy {Object} wire proxy on which to invoke the final method of the composition
-	 * @param composeString {String} function composition string
-	 *  of the form: 'transform1 | transform2 | ... | methodOnProxyTarget"
-	 *  @param {function} wire
-	 * @param {function} wire.resolveRef function to use is resolving references, returns a promise
-	 * @param {function} wire.getProxy function used to obtain a proxy for a component
-	 * @return {Promise} a promise for the composed function
-	 */
-	compose.parse = function parseCompose(proxy, composeString, wire) {
-
-		var bindSpecs, resolveRef, getProxy;
-
-		if(typeof composeString != 'string') {
-			return wire(composeString, function(func) {
-				return createProxyInvoker(proxy, func);
-			});
-		}
-
-		bindSpecs = composeString.split(/\s*\|\s*/);
-		resolveRef = wire.resolveRef;
-		getProxy = wire.getProxy;
-
-		function createProxyInvoker(proxy, method) {
-			return function() {
-				return proxy.invoke(method, arguments);
-			};
-		}
-
-		function createBound(proxy, bindSpec) {
-			var target, method;
-
-			target = bindSpec.split('.');
-
-			if(target.length > 2) {
-				throw new Error('Only 1 "." is allowed in refs: ' + bindSpec);
-			}
-
-			if(target.length > 1) {
-				method = target[1];
-				target = target[0];
-				if(!target) {
-					return function(target) {
-						return target[method].apply(target, slice.call(arguments, 1));
-					};
-				}
-				return when(getProxy(target), function(proxy) {
-					return createProxyInvoker(proxy, method);
-				});
-			} else {
-				if(proxy && typeof proxy.get(bindSpec) == 'function') {
-					return createProxyInvoker(proxy, bindSpec);
-				} else {
-					return resolveRef(bindSpec);
-				}
-
-//				return when(resolveRef(bindSpec),
-//					null,
-//					function() {
-//						return createProxyInvoker(proxy, bindSpec);
-//					}
-//				);
-			}
-
-		}
-
-		// First, resolve each transform function, stuffing it into an array
-		// The result of this reduce will an array of concrete functions
-		// Then add the final context[method] to the array of funcs and
-		// return the composition.
-		return when.reduce(bindSpecs, function(funcs, bindSpec) {
-			return when(createBound(proxy, bindSpec), function(func) {
-				funcs.push(func);
-				return funcs;
-			});
-		}, []).then(
-			function(funcs) {
-				var context = proxy && proxy.target;
-				return (funcs.length == 1 ? funcs[0] : compose(funcs)).bind(context);
-			}
-		);
-	};
-
-	function conditionalWhen(promiseOrValue, onFulfill, onReject) {
-		return when.isPromise(promiseOrValue)
-			? when(promiseOrValue, onFulfill, onReject)
-			: onFulfill(promiseOrValue);
-	}
-
-	return {
-		compose: compose,
-		partial: partial
-	};
-
-});
-})(typeof define == 'function'
-	// AMD
-	? define
-	// CommonJS
-	: function(factory) { module.exports = factory(require); }
-);
-
-/** @license MIT License (c) copyright B Cavalier & J Hann */
+/** @license MIT License (c) copyright 2010-2013 original author or authors */
 
 /**
  * Licensed under the MIT License at:
  * http://www.opensource.org/licenses/mit-license.php
+ *
+ * @author: Brian Cavalier
+ * @author: John Hann
  */
-
 (function(define){ 
-define('wire/lib/component',[],function() {
+define('wire/lib/context',['require','when','./object','./loader/adapter','./loader/relative','./Container'],function(require) {
 
-	var undef;
-
-	/**
-	 * Creates an object by either invoking ctor as a function and returning the result,
-	 * or by calling new ctor().  It uses a simple heuristic to try to guess which approach
-	 * is the "right" one.
-	 *
-	 * @param ctor {Function} function or constructor to invoke
-	 * @param args {Array} array of arguments to pass to ctor in either case
-	 *
-	 * @return The result of invoking ctor with args, with or without new, depending on
-	 * the strategy selected.
-	 */
-	return function createComponent(ctor, args, forceConstructor) {
-
-		var begotten, ctorResult;
-
-		if (forceConstructor || isConstructor(ctor)) {
-			begotten = Object.create(ctor.prototype);
-			defineConstructorIfPossible(begotten, ctor);
-			ctorResult = ctor.apply(begotten, args);
-			if(ctorResult !== undef) {
-				begotten = ctorResult;
-			}
-
-		} else {
-			begotten = ctor.apply(undef, args);
-
-		}
-
-		return begotten === undef ? null : begotten;
-	};
-
-	/**
-	 * Carefully sets the instance's constructor property to the supplied
-	 * constructor, using Object.defineProperty if available.  If it can't
-	 * set the constructor in a safe way, it will do nothing.
-	 *
-	 * @param instance {Object} component instance
-	 * @param ctor {Function} constructor
-	 */
-	function defineConstructorIfPossible(instance, ctor) {
-		try {
-			Object.defineProperty(instance, 'constructor', {
-				value: ctor,
-				enumerable: false
-			});
-		} catch(e) {
-			// If we can't define a constructor, oh well.
-			// This can happen if in envs where Object.defineProperty is not
-			// available, or when using cujojs/poly or other ES5 shims
-		}
-	}
-
-	/**
-	 * Determines whether the supplied function should be invoked directly or
-	 * should be invoked using new in order to create the object to be wired.
-	 *
-	 * @param func {Function} determine whether this should be called using new or not
-	 *
-	 * @returns {Boolean} true iff func should be invoked using new, false otherwise.
-	 */
-	function isConstructor(func) {
-		var is = false, p;
-		for (p in func.prototype) {
-			if (p !== undef) {
-				is = true;
-				break;
-			}
-		}
-
-		return is;
-	}
-
-});
-})(typeof define == 'function'
-	// AMD
-	? define
-	// CommonJS
-	: function(factory) {
-		module.exports = factory();
-	}
-);
-(function(define) {
-define('wire/lib/invoker',[],function() {
-
-	return function(methodName, args) {
-		return function(target) {
-			return target[methodName].apply(target, args);
-		};
-	};
-
-});
-})(typeof define === 'function' && define.amd ? define : function(factory) { module.exports = factory(); });
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/**
- * Base wire plugin that provides properties, init, and destroy facets, and
- * a proxy for plain JS objects.
- *
- * wire is part of the cujo.js family of libraries (http://cujojs.com/)
- *
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- */
-
-(function(define) { 
-define('wire/lib/plugin/basePlugin',['require','when','../object','../functional','../component','../invoker'],function(require) {
-
-	var when, object, functional, createComponent, createInvoker,
-		whenAll, obj, undef;
+	var when, mixin, loaderAdapter, relativeLoader, Container;
 
 	when = require('when');
-	object = require('../object');
-	functional = require('../functional');
-	createComponent = require('../component');
-	createInvoker = require('../invoker');
-
-	whenAll = when.all;
-
-	obj = {};
-
-	function asArray(it) {
-		return Array.isArray(it) ? it : [it];
-	}
-
-	function invoke(func, proxy, args, wire) {
-        return when(wire(args, func, proxy.path),
-			function (resolvedArgs) {
-				return proxy.invoke(func, asArray(resolvedArgs));
-			}
-		);
-	}
-
-	function invokeAll(facet, wire) {
-		var options = facet.options;
-
-		if(typeof options == 'string') {
-			return invoke(options, facet, [], wire);
-
-		} else {
-			var promises, funcName;
-			promises = [];
-
-			for(funcName in options) {
-				promises.push(invoke(funcName, facet, options[funcName], wire));
-			}
-
-			return whenAll(promises);
-		}
-	}
-
-	//
-	// Mixins
-	//
-
-	function mixin(target, src) {
-		var name, s;
-
-		for(name in src) {
-			s = src[name];
-			if(!(name in target) || (target[name] !== s && (!(name in obj) || obj[name] !== s))) {
-				target[name] = s;
-			}
-		}
-
-		return target;
-	}
-
-	function doMixin(target, introduction, wire) {
-		introduction = typeof introduction == 'string'
-			? wire.resolveRef(introduction)
-			: wire(introduction);
-
-		return when(introduction, mixin.bind(null, target));
-	}
-
-	function mixinFacet(resolver, facet, wire) {
-		var target, intros;
-
-		target = facet.target;
-		intros = facet.options;
-
-		if(!Array.isArray(intros)) {
-			intros = [intros];
-		}
-
-		resolver.resolve(when.reduce(intros, function(target, intro) {
-			return doMixin(target, intro, wire);
-		}, target));
-	}
-
-    /**
-     * Factory that handles cases where you need to create an object literal
-     * that has a property whose name would trigger another wire factory.
-     * For example, if you need an object literal with a property named "create",
-     * which would normally cause wire to try to construct an instance using
-     * a constructor or other function, and will probably result in an error,
-     * or an unexpected result:
-     * myObject: {
-     *      create: "foo"
-     *    ...
-     * }
-     *
-     * You can use the literal factory to force creation of an object literal:
-     * myObject: {
-     *    literal: {
-     *      create: "foo"
-     *    }
-     * }
-     *
-     * which will result in myObject.create == "foo" rather than attempting
-     * to create an instance of an AMD module whose id is "foo".
-     */
-	function literalFactory(resolver, spec /*, wire */) {
-		resolver.resolve(spec.options);
-	}
+	mixin = require('./object').mixin;
+	loaderAdapter = require('./loader/adapter');
+	relativeLoader = require('./loader/relative');
+	Container = require('./Container');
 
 	/**
-	 * @deprecated Use create (instanceFactory) instead
-	 * @param resolver
-	 * @param componentDef
-	 * @param wire
-	 */
-	function protoFactory(resolver, componentDef, wire) {
-		var parentRef, promise;
-
-        parentRef = componentDef.options;
-
-        promise = typeof parentRef === 'string'
-                ? wire.resolveRef(parentRef)
-                : wire(parentRef);
-
-		resolver.resolve(promise.then(Object.create));
-	}
-
-	function propertiesFacet(resolver, facet, wire) {
-
-		var properties, path, setProperty, propertiesSet;
-
-		properties = facet.options;
-		path = facet.path;
-		setProperty = facet.set.bind(facet);
-
-		propertiesSet = when.map(Object.keys(facet.options), function(key) {
-			return wire(properties[key], facet.path)
-				.then(function(wiredProperty) {
-					setProperty(key, wiredProperty);
-				}
-			);
-		});
-
-		resolver.resolve(propertiesSet);
-	}
-
-	function invokerFactory(resolver, componentDef, wire) {
-
-		var invoker = wire(componentDef.options).then(function (invokerContext) {
-			// It'd be nice to use wire.getProxy() then proxy.invoke()
-			// here, but that means the invoker must always return
-			// a promise.  Not sure that's best, so for now, just
-			// call the method directly
-			return createInvoker(invokerContext.method, invokerContext.args);
-		});
-
-		resolver.resolve(invoker);
-	}
-
-	function invokerFacet(resolver, facet, wire) {
-		resolver.resolve(invokeAll(facet, wire));
-	}
-
-    //noinspection JSUnusedLocalSymbols
-    /**
-     * Wrapper for use with when.reduce that calls the supplied destroyFunc
-     * @param [unused]
-     * @param destroyFunc {Function} destroy function to call
-     */
-    function destroyReducer(unused, destroyFunc) {
-        return destroyFunc();
-    }
-
-	function cloneFactory(resolver, componentDef, wire) {
-		var sourceRef, options, cloned;
-
-		if (wire.resolver.isRef(componentDef.options.source)) {
-			sourceRef = componentDef.options.source;
-			options = componentDef.options;
-		}
-		else {
-			sourceRef = componentDef.options;
-			options = {};
-		}
-
-		cloned = wire(sourceRef).then(function (ref) {
-			return when(wire.getProxy(ref), function (proxy) {
-				if (!proxy.clone) {
-					throw new Error('No clone function found for ' + componentDef.id);
-				}
-
-				return proxy.clone(options);
-			});
-		});
-
-		resolver.resolve(cloned);
-	}
-
-	/**
-	 * Factory that uses an AMD module either directly, or as a
-	 * constructor or plain function to create the resulting item.
-	 *
-	 * @param {Object} resolver resolver to resolve with the created component
-	 * @param {Object} componentDef portion of the spec for the component to be created
-	 * @param {function} wire
-	 */
-	function instanceFactory(resolver, componentDef, wire) {
-		var create, args, isConstructor, module, instance;
-
-		create = componentDef.options;
-
-		if (typeof create == 'string') {
-			module = wire({ module: create });
-		} else if(wire.resolver.isRef(create)) {
-			module = wire(create);
-		} else if(object.isObject(create) && create.module) {
-			module = wire({ module: create.module });
-			args = create.args ? wire(asArray(create.args)) : [];
-			isConstructor = create.isConstructor;
-		} else {
-			module = create;
-		}
-
-		instance = when.join(module, args).spread(createInstance);
-
-		resolver.resolve(instance);
-
-		// Load the module, and use it to create the object
-		function createInstance(module, args) {
-			// We'll either use the module directly, or we need
-			// to instantiate/invoke it.
-			return typeof module == 'function'
-				? createComponent(module, args, isConstructor)
-				: Object.create(module);
-		}
-	}
-
-	function composeFactory(resolver, componentDef, wire) {
-		var options, promise;
-
-		options = componentDef.options;
-
-		if(typeof options == 'string') {
-			promise = functional.compose.parse(undef, options, wire);
-		} else {
-			// Assume it's an array of things that will wire to functions
-			promise = when(wire(options), function(funcArray) {
-				return functional.compose(funcArray);
-			});
-		}
-
-		resolver.resolve(promise);
-	}
-
-	return {
-		wire$plugin: function(ready, destroyed /*, options */) {
-            // Components in the current context that will be destroyed
-            // when this context is destroyed
-			var destroyFuncs, plugin;
-
-			destroyFuncs = [];
-
-			when(destroyed, function() {
-                return when.reduce(destroyFuncs, destroyReducer, 0);
-			});
-
-			function destroyFacet(resolver, facet, wire) {
-				destroyFuncs.push(function destroyObject() {
-					return invokeAll(facet, wire);
-				});
-
-				// This resolver is just related to *collecting* the functions to
-				// invoke when the component is destroyed.
-				resolver.resolve();
-			}
-
-			plugin = {
-				factories: {
-					create: instanceFactory,
-					literal: literalFactory,
-					prototype: protoFactory,
-					clone: cloneFactory,
-					compose: composeFactory,
-					invoker: invokerFactory
-				},
-				facets: {
-					// properties facet.  Sets properties on components
-					// after creation.
-					properties: {
-						configure: propertiesFacet
-					},
-					mixin: {
-						configure: mixinFacet
-					},
-					// init facet.  Invokes methods on components during
-					// the "init" stage.
-					init: {
-						initialize: invokerFacet
-					},
-					// ready facet.  Invokes methods on components during
-					// the "ready" stage.
-					ready: {
-						ready: invokerFacet
-					},
-					// destroy facet.  Registers methods to be invoked
-					// on components when the enclosing context is destroyed
-					destroy: {
-						ready: destroyFacet
-					}
-				}
-			};
-
-			// "introduce" is deprecated, but preserved here for now.
-			plugin.facets.introduce = plugin.facets.mixin;
-
-			return plugin;
-		}
-	};
-});
-})(typeof define == 'function'
-	? define
-	: function(factory) { module.exports = factory(require); }
-);
-
-/**
- * defaultPlugins
- * @author: brian
- */
-(function(define) {
-define('wire/lib/plugin/defaultPlugins',['require','./wirePlugin','./basePlugin'],function(require) {
-
-	return [
-		require('./wirePlugin'),
-		require('./basePlugin')
-	];
-
-});
-}(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
-
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/**
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- *
- * @author brian@hovercraftstudios.com
- */
-
-(function(define) { 
-define('wire/lib/scope',['require','when','when/sequence','./array','./object','./async','./loader','./lifecycle','./resolver','./proxy','./plugin/registry','./plugin/defaultPlugins'],function(require) {
-
-	var when, sequence, array, object, async, loader, Lifecycle, Resolver,
-		proxy, createPluginRegistry, defaultPlugins,
-		defer, whenAll, scope, undef;
-
-	when = require('when');
-	sequence = require('when/sequence');
-	array = require('./array');
-	object = require('./object');
-	async = require('./async');
-	loader = require('./loader');
-	Lifecycle = require('./lifecycle');
-	Resolver = require('./resolver');
-	proxy = require('./proxy');
-	createPluginRegistry = require('./plugin/registry');
-	defaultPlugins = require('./plugin/defaultPlugins');
-
-	defer = when.defer;
-	whenAll = when.all;
-
-	function createScope(spec, parent, options) {
-		var s = Object.create(scope, options ? createPropertyDescriptors(options) : {});
-		return s.init(spec, parent);
-	}
-
-	function createPropertyDescriptors(options) {
-		return Object.keys(options).reduce(function(descriptor, key) {
-			descriptor[key] = { value: options[key] };
-			return descriptor;
-		}, {});
-	}
-
-	scope = {
-		contextHandlers: {},
-
-		init: function(spec, parent) {
-			var self, ready, contextDestroyed, taskContext;
-
-			self = this;
-			ready = defer();
-			contextDestroyed = defer();
-
-			this.parent = parent || {};
-			this.ready = ready.promise;
-			this.destroyed = contextDestroyed.promise;
-
-			this._inherit(this.parent, ready.promise, contextDestroyed.promise);
-			this._initPluginApi();
-			this._initDefaultPlugins();
-			this._configure();
-
-			taskContext = {
-				components: this.components,
-				spec: this.spec
-			};
-
-			this._executeTasks = function(tasks) {
-				return sequence(tasks, taskContext);
-			};
-
-			this._destroy = function() {
-				this._destroy = noop;
-				contextDestroyed.resolve();
-				return this._destroyComponents();
-			};
-
-			return this._executeInitializers()
-				.then(prepareScope)
-				.then(finalizeScope)
-				.yield(ready.promise);
-
-			function prepareScope() {
-				self._parseSpec(spec, ready.resolver);
-				self._createComponents(spec);
-			}
-
-			function finalizeScope() {
-				self._ensureAllModulesLoaded();
-			}
-		},
-
-		destroy: function() {
-			return this._destroy();
-		},
-
-		getModule: function(moduleId, spec) {
-			var self, module;
-
-			self = this;
-			module = defer();
-
-			scanPluginWhenLoaded(typeof moduleId == 'string'
-				? this.moduleLoader(moduleId)
-				: moduleId, module.resolver);
-
-			return module.promise;
-
-			function scanPluginWhenLoaded(loadModulePromise, moduleReadyResolver) {
-
-				var loadPromise = when(loadModulePromise, function (module) {
-					return when(self._scanPlugin(module, spec), function() {
-						moduleReadyResolver.resolve(self.modulesReady.promise.yield(module));
-					});
-				}, moduleReadyResolver.reject);
-
-				self.modulesToLoad && self.modulesToLoad.push(loadPromise);
-
-			}
-		},
-
-		getProxy: function(nameOrComponent, onBehalfOf) {
-			var self = this;
-			return typeof nameOrComponent == 'string'
-				? when(this._resolveRefName(nameOrComponent, {}, onBehalfOf), function (component) {
-					return self._createProxy(component);
-				})
-				: self._createProxy(nameOrComponent);
-		},
-
-		_createProxy: function(component, metadata) {
-			var self, lifecycle;
-
-			self = this;
-			lifecycle = this.lifecycle;
-
-			return when(this.modulesReady.promise, function() {
-				// Create the base proxy
-				var componentProxy = proxy.create(component, lifecycle, metadata);
-
-				// Allow proxy plugins to process/modify the proxy
-				componentProxy = self.plugins.proxiers.reduce(
-					function(componentProxy, proxyHandler) {
-						var overridden = proxyHandler(componentProxy);
-						return proxy.isProxy(overridden) ? overridden : componentProxy;
-					},
-					componentProxy
-				);
-
-				if(metadata) {
-					componentProxy.path = metadata.path = self._createPath(metadata.id);
-					self.proxiedComponents.push(componentProxy);
-				}
-
-				return componentProxy;
-			});
-		},
-
-		_inherit: function(parent, ready, destroyed) {
-			var self = this;
-
-			// Descend scope and plugins from parent so that this scope can
-			// use them directly via the prototype chain
-
-			this._api = {
-				createChild: wireChild.bind(this),
-				destroy: this.destroy.bind(this),
-				resolve: function(ref, onBehalfOf) {
-					return when.resolve(self._resolveRef(ref, onBehalfOf));
-				}
-			};
-
-			WireContext.prototype =
-				this._createWireApi(this._api, object.inherit(parent.components));
-			this.components = new WireContext();
-			WireContext.prototype = undef;
-
-			this.metadata = object.inherit(parent.metadata);
-
-			this.path = this._createPath(this.name, parent.path);
-			this.plugins = createPluginRegistry(parent.plugins||{}, ready, destroyed);
-
-			this.contextHandlers.init = array.delegate(this.contextHandlers.init);
-			this.contextHandlers.destroy = array.delegate(this.contextHandlers.destroy);
-
-			this.proxiedComponents = [];
-
-			// These should not be public
-			this.modulesToLoad = [];
-			this.modulesReady = defer();
-			this.moduleLoader = loader(parent, this).load;
-
-			// TODO: Fix this
-			// When the parent begins its destroy phase, this child must
-			// begin its destroy phase and complete it before the parent.
-			// The context hierarchy will be destroyed from child to parent.
-			if (parent.destroyed) {
-				when(parent.destroyed, this.destroy.bind(this));
-			}
-
-			function wireChild(spec, options) {
-				return self.createContext(spec, {
-					moduleLoader: self.moduleLoader,
-					components: self.components,
-					metadata: self.metadata,
-					destroyed: destroyed
-				}, options);
-			}
-		},
-
-		_initPluginApi: function() {
-			// Plugin API
-			// wire() API that is passed to plugins.
-			var self, api, pluginApi;
-
-			self = this;
-			api = this._api;
-
-			pluginApi = this._pluginApi = {};
-
-			pluginApi.contextualize = function(name) {
-				function contextualApi(spec, name, path) {
-					return self._resolveItem(spec, { id: self._createPath(name, path) });
-				}
-
-				contextualApi.createChild = api.createChild;
-
-				contextualApi.resolveRef = function(ref) {
-					var onBehalfOf = arguments.length > 1 ? arguments[2] : name;
-					return api.resolve(ref, onBehalfOf);
-				};
-
-				contextualApi.getProxy = function(nameOrComponent) {
-					var onBehalfOf = arguments.length > 1 ? arguments[2] : name;
-					return self.getProxy(nameOrComponent, onBehalfOf);
-				};
-
-				contextualApi.resolver = pluginApi.resolver;
-
-				return contextualApi;
-			};
-		},
-
-		_initDefaultPlugins: function() {
-			var self = this;
-
-			defaultPlugins.forEach(this._scanPlugin, this);
-
-			// Add a contextualized module factory
-			this.plugins.registerPlugin({ factories: {
-				module: function(resolver, componentDef) {
-					resolver.resolve(self.getModule(componentDef.options, componentDef.spec));
-				}
-			}});
-		},
-
-		_createWireApi: function(api, context) {
-			var wireApi = context.wire = function() {
-				return api.createChild.apply(undef, arguments);
-			};
-			wireApi.destroy = context.destroy = api.destroy;
-
-			// Consider deprecating resolve
-			// Any reference you could resolve using this should simply
-			// be injected instead.
-			wireApi.resolve = context.resolve = api.resolve;
-
-			return context;
-		},
-
-		_configure: function() {
-			var config = {
-				pluginApi: this._pluginApi,
-				plugins: this.plugins
-			};
-
-			this.lifecycle = new Lifecycle(config);
-			this.resolver = this._pluginApi.resolver = new Resolver(config);
-		},
-
-		_executeInitializers: function() {
-			return this._executeTasks(this.contextHandlers.init);
-		},
-
-		_parseSpec: function(spec, scopeResolver) {
-			var promises, components, metadata, name, d;
-
-			components = this.components;
-			metadata = this.metadata;
-			promises = [];
-
-			// Setup a promise for each item in this scope
-			for (name in spec) {
-				// An initializer may have inserted concrete components
-				// into the context.  If so, they override components of the
-				// same name from the input spec
-				if(!object.hasOwn(components, name)) {
-					d = defer();
-
-					metadata[name] = {
-						id: name,
-						spec: spec[name],
-						promise: d.promise,
-						resolver: d.resolver
-					};
-
-					promises.push(components[name] = d.promise);
-				}
-			}
-
-			// When all scope item promises are resolved, the scope
-			// is ready. When this scope is ready, resolve the promise
-			// with the objects that were created
-			scopeResolver.resolve(whenAll(promises).yield(this));
-		},
-
-		_createComponents: function(spec) {
-			// Process/create each item in scope and resolve its
-			// promise when completed.
-			var metadata = this.metadata;
-			Object.keys(metadata).forEach(function(name) {
-				this._createScopeItem(spec[name], metadata[name]);
-			}.bind(this));
-		},
-
-		_createScopeItem: function(spec, itemMetadata) {
-			// NOTE: Order is important here.
-			// The object & local property assignment MUST happen before
-			// the chain resolves so that the concrete item is in place.
-			// Otherwise, the whole scope can be marked as resolved before
-			// the final item has been resolved.
-			var item, itemResolver, self;
-
-			self = this;
-			item = this._resolveItem(spec, itemMetadata);
-			itemResolver = itemMetadata.resolver;
-
-			when(item, function (resolved) {
-				self._makeResolvable(itemMetadata, resolved);
-				itemResolver.resolve(resolved);
-			}, itemResolver.reject);
-		},
-
-		_makeResolvable: function(metadata, component) {
-			var id = metadata.id;
-			if(id != null) {
-				this.components[id] = proxy.getTarget(async.getValue(component));
-			}
-		},
-
-		_resolveItem: function(spec, itemMetadata) {
-			var item;
-
-			if (this.resolver.isRef(spec)) {
-				// Reference
-				item = this._resolveRef(spec, itemMetadata.id);
-			} else {
-				// Component
-				item = this._createItem(spec, itemMetadata);
-			}
-
-			return item;
-		},
-
-		_createItem: function(spec, itemMetadata) {
-			var created;
-
-			if (Array.isArray(spec)) {
-				// Array
-				created = this._createArray(spec, itemMetadata);
-
-			} else if (object.isObject(spec)) {
-				// component spec, create the component
-				created = this._createComponent(spec, itemMetadata);
-
-			} else {
-				// Plain value
-				created = when.resolve(spec);
-			}
-
-			return created;
-		},
-
-		_createArray: function(arrayDef, arrayMetadata) {
-			var self = this;
-			// Minor optimization, if it's an empty array spec, just return an empty array.
-			return arrayDef.length
-				? when.map(arrayDef, function(item) {
-					return self._resolveItem(item, { id: arrayMetadata.id + '[]' });
-				})
-				: [];
-		},
-
-		_createComponent: function(spec, componentMetadata) {
-
-			var self, name;
-
-			self = this;
-			name = componentMetadata.id;
-
-			// Look for a factory, then use it to create the object
-			return when(this._findFactory(spec),
-				function (found) {
-					var component, factory, options;
-
-					component = defer();
-					factory = found.factory;
-					options = found.options;
-
-					if (!spec.id) {
-						spec.id = name;
-					}
-
-					factory(component.resolver, options,
-						self._pluginApi.contextualize(name));
-
-					return when(component.promise, function(createdComponent) {
-						return self.plugins.isPlugin(createdComponent)
-							? createdComponent
-							: self._processComponent(createdComponent, componentMetadata);
-					}).then(proxy.getTarget);
-				},
-				function () {
-					// No factory found, treat object spec as a nested scope
-					return createScope(spec, self).then(function(childScope) {
-						// TODO: find a lighter weight solution
-						// We are effectively paying the cost of creating a complete scope,
-						// and then discarding everything except the component map.
-						return object.mixin({}, childScope.components);
-					});
-				}
-			);
-		},
-
-		_processComponent: function(component, metadata) {
-			var self = this;
-
-			return when(self._createProxy(component, metadata), function(proxy) {
-				return proxy.init();
-
-			}).then(function(proxy) {
-				// Components become resolvable after the initialization phase
-				// This allows circular references to be resolved after init
-				self._makeResolvable(metadata, proxy);
-				return proxy.startup();
-			});
-		},
-
-		_findFactory: function(spec) {
-
-			var plugins, found;
-
-			plugins = this.plugins;
-
-			found = getFactory(plugins, spec);
-			if(!found) {
-				found = when(this.modulesReady.promise, function () {
-					return getFactory(plugins, spec) || when.reject();
-				});
-			}
-
-			return found;
-		},
-
-		_ensureAllModulesLoaded: function() {
-			var self = this;
-			this.modulesReady.resolve(async.until(waitForModules, 0, allModulesLoaded));
-
-			function waitForModules() {
-				var modulesToLoad = self.modulesToLoad;
-				self.modulesToLoad = [];
-
-				return whenAll(modulesToLoad);
-			}
-
-			function allModulesLoaded() {
-				return self.modulesToLoad.length === 0;
-			}
-		},
-
-		_scanPlugin: function(module, spec) {
-			var metadata;
-			if(spec && spec.id) {
-				metadata = this.metadata[spec.id];
-				if(metadata) {
-					metadata.isPlugin = this.plugins.isPlugin(module);
-				}
-			}
-			return this.plugins.scanModule(module, spec);
-		},
-
-		_destroy: noop,
-
-		_destroyComponents: function() {
-			var lifecycle, self;
-
-			self = this;
-			lifecycle = this.lifecycle;
-
-			return shutdownComponents(this.proxiedComponents)
-				.then(destroyComponents)
-				.then(releaseResources)
-				.then(this._executeDestroyers.bind(this));
-
-			function shutdownComponents(proxiedComponents) {
-				return when.reduce(proxiedComponents,
-					function(_, proxied) { return proxied.shutdown(); },
-					undef);
-			}
-
-			function destroyComponents() {
-				var components, p;
-
-				components = self.components;
-
-				for (p in  components) {
-					delete components[p];
-				}
-
-				return when.reduce(self.proxiedComponents,
-					function(_, proxied) { return proxied.destroy(); },
-					undef);
-			}
-
-			function releaseResources() {
-				// Free Objects
-				self.components = self.parent = self.wireApi
-					= self.proxiedComponents = self._pluginApi = self.plugins
-					= undef;
-			}
-		},
-
-		_executeDestroyers: function() {
-			return this._executeTasks(this.contextHandlers.destroy);
-		},
-
-		_resolveRef: function(ref, onBehalfOf) {
-			var scope;
-
-			ref = this.resolver.parse(ref);
-			scope = onBehalfOf == ref.name && this.parent.components ? this.parent : this;
-
-			return this._doResolveRef(ref, scope.components, onBehalfOf);
-		},
-
-		_resolveRefName: function(refName, options, onBehalfOf) {
-			var ref = this.resolver.create(refName, options);
-
-			return this._doResolveRef(ref, this.components, onBehalfOf);
-		},
-
-		_doResolveRef: function(ref, scope, onBehalfOf) {
-			return when(this.modulesReady.promise, resolveRef);
-
-			function resolveRef() {
-				return ref.resolve(function(name) {
-					return resolveDeepName(name, scope);
-				}, onBehalfOf);
-			}
-		},
-
-		_createPath: function(name, basePath) {
-			var path = basePath || this.path;
-			return (path && name) ? (path + '.' + name) : name;
-		}
-	};
-
-	return createScope;
-
-	function resolveDeepName(name, scope) {
-		var parts = name.split('.');
-
-		if(parts.length > 2) {
-			return when.reject('Only 1 "." is allowed in refs: ' + name);
-		}
-
-		return when.reduce(parts, function(scope, segment) {
-			return segment in scope
-				? scope[segment]
-				: when.reject('Cannot resolve ref: ' + name);
-		}, scope);
-	}
-
-	function getFactory(plugins, spec) {
-		var f, factories, found;
-
-		factories = plugins.factories;
-
-		for (f in factories) {
-			if (object.hasOwn(spec, f)) {
-				found = {
-					factory: factories[f],
-					options: {
-						options: spec[f],
-						spec: spec
-					}
-				};
-				break;
-			}
-		}
-
-		// Intentionally returns undefined if no factory found
-		return found;
-	}
-
-	function noop() {}
-
-	function WireContext() {}
-
-});
-})(typeof define == 'function'
-	// AMD
-	? define
-	// CommonJS
-	: function(factory) { module.exports = factory(require); }
-);
-/** @license MIT License (c) copyright B Cavalier & J Hann */
-
-/**
- * Licensed under the MIT License at:
- * http://www.opensource.org/licenses/mit-license.php
- */
-
-(function(define){ 
-define('wire/lib/context',['require','./loader','./scope'],function(require) {
-
-	var loader, createScope;
-
-	loader = require('./loader');
-	createScope = require('./scope');
-
-	return createContext;
-
-	/**
-	 * Creates a new context from the supplied specs, with the supplied parent context.
-	 * If specs is an {Array}, it may be a mixed array of string module ids, and object
-	 * literal specs.  All spec module ids will be loaded, and then all specs will be
-	 * merged from left-to-right (rightmost wins), and the resulting, merged spec will
+	 * Creates a new context from the supplied specs, with the supplied
+	 * parent context. If specs is an {Array}, it may be a mixed array
+	 * of string module ids, and object literal specs.  All spec module
+	 * ids will be loaded, and then all specs will be merged from
+	 * left-to-right (rightmost wins), and the resulting, merged spec will
 	 * be wired.
 	 * @private
 	 *
@@ -3506,30 +4813,93 @@ define('wire/lib/context',['require','./loader','./scope'],function(require) {
 	 *
 	 * @return {Promise} a promise for the new context
 	 */
-	function createContext(specs, parent, options) {
+	return function createContext(specs, parent, options) {
 		// Do the actual wiring after all specs have been loaded
 
-		if(!options) {
-			options = {}
-		}
+		if(!options) { options = {}; }
+		if(!parent)  { parent  = {}; }
 
 		options.createContext = createContext;
 
-		var moduleLoader = loader(parent, options);
+		var specLoader = createSpecLoader(parent.moduleLoader, options.require);
 
-		return moduleLoader.merge(specs).then(function(spec) {
-			return createScope(spec, parent, options)
-				.then(function(scope) {
-					return scope.components;
+		return when(specs, function(specs) {
+			options.moduleLoader =
+				createContextLoader(specLoader, findBaseId(specs));
+
+			return mergeSpecs(specLoader, specs).then(function(spec) {
+
+				var container = new Container(parent, options);
+
+				// Expose only the component instances and controlled API
+				return container.init(spec).then(function(context) {
+					return context.instances;
 				});
+			});
+		});
+	};
+
+	function createContextLoader(parentLoader, baseId) {
+		return baseId ? relativeLoader(parentLoader, baseId) : parentLoader;
+	}
+
+	/**
+	 * Create a module loader
+	 * @param {function} [platformLoader] platform require function with which
+	 *  to configure the module loader
+	 * @param {function} [parentLoader] existing module loader from which
+	 *  the new module loader will inherit, if provided.
+	 * @return {Object} module loader with load() and merge() methods
+	 */
+	function createSpecLoader(parentLoader, platformLoader) {
+		var loadModule = typeof platformLoader == 'function'
+			? loaderAdapter(platformLoader)
+			: parentLoader || loaderAdapter(require);
+
+		return loadModule;
+	}
+
+	function findBaseId(specs) {
+		var firstId;
+
+		if(typeof specs === 'string') {
+			return specs;
+		}
+
+		if(!Array.isArray(specs)) {
+			return;
+		}
+
+		specs.some(function(spec) {
+			if(typeof spec === 'string') {
+				firstId = spec;
+				return true;
 			}
-		);
+		});
+
+		return firstId;
+	}
+
+	function mergeSpecs(moduleLoader, specs) {
+		return when(specs, function(specs) {
+			return when.resolve(Array.isArray(specs)
+				? mergeAll(moduleLoader, specs)
+				: (typeof specs === 'string' ? moduleLoader(specs) : specs));
+		});
+	}
+
+	function mergeAll(moduleLoader, specs) {
+		return when.reduce(specs, function(merged, module) {
+			return typeof module == 'string'
+				? when(moduleLoader(module), function(spec) { return mixin(merged, spec); })
+				: mixin(merged, module);
+		}, {});
 	}
 
 });
 }(typeof define === 'function' ? define : function(factory) { module.exports = factory(require); }));
 
-/** @license MIT License (c) copyright B Cavalier & J Hann */
+/** @license MIT License (c) copyright 2011-2013 original author or authors */
 
 /*jshint sub:true*/
 
@@ -3537,19 +4907,21 @@ define('wire/lib/context',['require','./loader','./scope'],function(require) {
  * wire
  * Javascript IOC Container
  *
- * wire is part of the cujo.js family of libraries (http://cujojs.com/)
+ * wire is part of the cujoJS family of libraries (http://cujojs.com/)
  *
  * Licensed under the MIT License at:
  * http://www.opensource.org/licenses/mit-license.php
  *
- * @version 0.9.1
+ * @author Brian Cavalier
+ * @author John Hann
+ * @version 0.10.3
  */
 (function(rootSpec, define){ 
 define('wire/wire',['require','./lib/context'],function(require) {
 
 	var createContext, rootContext, rootOptions;
 
-	wire.version = '0.9.1';
+	wire.version = '0.10.3';
 
 	createContext = require('./lib/context');
 
@@ -3592,21 +4964,25 @@ define('wire/wire',['require','./lib/context'],function(require) {
 	/**
 	 * AMD Loader plugin API
 	 * @param name {String} spec module id, or comma-separated list of module ids
-	 * @param require {Function} loader-provide local require function
-	 * @param callback {Function} callback to call when wiring is completed. May have
-	 *  and error property that a function to call to inform the AMD loader of an error.
-	 *  See here: https://groups.google.com/forum/?fromgroups#!topic/amd-implement/u0f161drdJA
+	 * @param require {Function} loader-provided local require function
+	 * @param done {Function} loader-provided callback to call when wiring
+	 *  is completed. May have and error property that a function to call to
+	 *  inform the AMD loader of an error.
+	 *  See here:
+	 *  https://groups.google.com/forum/?fromgroups#!topic/amd-implement/u0f161drdJA
 	 */
-	wire.load = function amdLoad(name, require, callback /*, config */) {
+	wire.load = function amdLoad(name, require, done /*, config */) {
 		// If it's a string, try to split on ',' since it could be a comma-separated
 		// list of spec module ids
-		var errback = callback.error || function(e) {
+		wire(name.split(','), { require: require })
+			.then(done, done.error)
+			.otherwise(crash);
+
+		function crash(e) {
 			// Throw uncatchable exception for loaders that don't support
 			// AMD error handling.  This will propagate up to the host environment
 			setTimeout(function() { throw e; }, 0);
-		};
-
-		wire(name.split(','), { require: require }).then(callback, errback);
+		}
 	};
 
 	/**
@@ -3626,7 +5002,7 @@ define('wire/wire',['require','./lib/context'],function(require) {
 );
 define('wire', ['wire/wire'], function (main) { return main; });
 
-define('fixture/spec1', ['fixture/module1', 'fixture/spec2'], {
+define('fixture/spec1', ['fixture/module1', 'fixture/spec2', 'fixture/plugin1', 'fixture/plugin2'], {
 
 		module1: {
 		module: 'fixture/module1'
@@ -3634,7 +5010,12 @@ define('fixture/spec1', ['fixture/module1', 'fixture/spec2'], {
 
 		some_child_spec: {
 		spec: 'fixture/spec2'
-	}
+	},
+
+	$plugins: [
+		'fixture/plugin1',
+		{ module: 'fixture/plugin2' }
+	]
 } );
 
 define('fixture/module1',[], function() {
@@ -3657,3 +5038,24 @@ define('fixture/module2', [ './module1' ], function( module1 ) {
 
 	return module1;
 } );
+
+define('fixture/plugin1',[],function() {
+
+	return function(options) {
+
+		return {
+			// Plugin 1
+		};
+	}
+
+});
+define('fixture/plugin2',[],function() {
+
+	return function(options) {
+
+		return {
+			// Plugin 2
+		};
+	}
+
+});

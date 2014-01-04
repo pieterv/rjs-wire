@@ -9,5 +9,10 @@ define( {
 	// Include child wire specification
 	some_child_spec: {
 		spec: 'fixture/spec2'
-	}
+	},
+
+	$plugins: [
+		'fixture/plugin1',
+		{ module: 'fixture/plugin2' }
+	]
 } );

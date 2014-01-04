@@ -3,6 +3,10 @@
   "version": "0.0.0",
   "dependencies": {},
   "devDependencies": {
-    "requirejs": "~2.1.4"
+    "wire": "*",
+    "when": "*",
+    "meld": "*",
+    "requirejs": "*",
+    "wire-rjs-builder": "git://github.com/pieter-vanderwerff/wire-rjs-builder"
   }
 }
